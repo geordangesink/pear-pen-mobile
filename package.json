@@ -1,0 +1,79 @@
+{
+  "name": "pear-pen-mobile",
+  "productName": "PearPen",
+  "version": "1.0.0",
+  "description": "A quiet place to sign together.",
+  "upgrade": "",
+  "private": true,
+  "main": "index.ts",
+  "license": "Apache-2.0",
+  "scripts": {
+    "start": "expo start",
+    "bundle:bare": "bare-pack --host ios-arm64 --host ios-arm64-simulator --host ios-x64-simulator --host android-arm64 --linked --out ./src/worker.bundle.js ./workers/main.js",
+    "bundle:react-native": "react-native bundle --platform ios --dev false --entry-file index.ts --bundle-output out/ios/PearPen/app.bundle --assets-dest out/ios/PearPen && react-native bundle --platform android --dev false --entry-file index.ts --bundle-output out/android/PearPen/app.bundle --assets-dest out/android/PearPen",
+    "build": "node scripts/check-upgrade.js && pear-build --ios-arm64 ./out/ios/PearPen --ios-arm64-simulator ./out/ios/PearPen --ios-x64-simulator ./out/ios/PearPen --android-arm64 ./out/android/PearPen --package ./package.json --config ./pear.json --target dist",
+    "update": "node scripts/check-upgrade.js && npm run bundle:bare && npm run bundle:react-native && npm run build",
+    "prebuild": "expo prebuild",
+    "build:ios": "bash scripts/build-ios.sh",
+    "build:android": "bash scripts/build-android.sh",
+    "ios": "npm run bundle:bare && expo run:ios",
+    "android": "npm run bundle:bare && expo run:android",
+    "production:ios": "node scripts/check-upgrade.js && npm run ios -- --configuration Release",
+    "production:android": "node scripts/check-upgrade.js && npm run android -- --variant release",
+    "typecheck": "tsc --noEmit",
+    "lint": "prettier --check .",
+    "format": "prettier --write .",
+    "test": "npm run typecheck && npm run lint && npm run test:core",
+    "test:core": "node --test core/test/*.test.js"
+  },
+  "dependencies": {
+    "@expo/vector-icons": "^15.1.1",
+    "b4a": "^1.8.0",
+    "expo": "^55.0.8",
+    "expo-asset": "~55.0.10",
+    "expo-build-properties": "~55.0.10",
+    "expo-clipboard": "~55.0.15",
+    "expo-document-picker": "~55.0.8",
+    "expo-file-system": "~55.0.15",
+    "expo-font": "~55.0.4",
+    "expo-modules-core": "^55.0.17",
+    "expo-sharing": "~55.0.25",
+    "expo-status-bar": "~55.0.4",
+    "expo-system-ui": "~55.0.10",
+    "framed-stream": "^1.0.1",
+    "hypercore-signing-request": "4.0.2",
+    "pear-mobile": "^4.3.0",
+    "pear-pen-core": "file:core",
+    "pear-runtime": "^1.3.1",
+    "pear-runtime-react-native": "^3.0.1",
+    "react": "19.2.0",
+    "react-native": "0.83.2",
+    "react-native-bare-kit": "0.15.6",
+    "react-native-safe-area-context": "~5.6.2"
+  },
+  "devDependencies": {
+    "@react-native-community/cli": "^20.1.3",
+    "@react-native/metro-config": "^0.84.0",
+    "@types/react": "~19.2.10",
+    "bare-pack": "^2.0.0",
+    "pear-build": "^1.2.0",
+    "pear-link": "^5.0.1",
+    "prettier": "^3.8.1",
+    "prettier-config-holepunch": "^2.0.0",
+    "typescript": "~5.9.2"
+  },
+  "imports": {
+    "pear-runtime": {
+      "ios": "pear-mobile",
+      "android": "pear-mobile",
+      "simulator": "pear-mobile",
+      "default": "pear-runtime"
+    }
+  },
+  "overrides": {
+    "hypercore-signing-request": {
+      "hypercore": "^11.40.3",
+      "hyperdrive": "^13.3.4"
+    }
+  }
+}

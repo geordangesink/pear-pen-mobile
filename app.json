@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "Pear Pen",
+    "slug": "pear-pen-mobile",
+    "scheme": "pear-pen",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "plugins": [
+      ["pear-runtime-react-native"],
+      ["expo-build-properties", { "android": { "minSdkVersion": 29 } }],
+      "expo-document-picker"
+    ],
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#25262c"
+    },
+    "ios": { "supportsTablet": true, "bundleIdentifier": "com.pearpen.app" },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#25262c"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.pearpen.app"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+node_modules
+out
+dist
+ios
+android
+modules
+src/worker.bundle.js
+core

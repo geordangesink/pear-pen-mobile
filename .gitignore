@@ -1,0 +1,15 @@
+node_modules/
+.expo/
+ios/
+android/
+modules/pear-runtime-reload/
+src/worker.bundle.js
+out/
+dist/
+*.tgz
+*.jks
+*.keystore
+*.p12
+*.mobileprovision
+.env*
+.DS_Store
