@@ -8,13 +8,36 @@ const crypto = require('hypercore-crypto')
 const sodium = require('sodium-native')
 const c = require('compact-encoding')
 const z32 = require('z32')
+const id = require('hypercore-id-encoding')
 const Hyperdrive = require('hyperdrive')
+const { inflate } = require('hypercore/lib/multisig')
 const SecretStream = require('@hyperswarm/secret-stream')
 const CoreSign = require('hypercore-sign')
 const SigningRequest = require('hypercore-signing-request')
 const PearPen = require('..')
 const keys = require('../lib/keys')
 const protocol = require('../lib/protocol')
+const { createUpdateBatch, commitUpdateBatch } = require('../lib/batches')
+
+async function createDrive(store, publicKeys, namespace) {
+  const manifest = {
+    version: 1,
+    hash: 'blake2b',
+    quorum: Math.floor(publicKeys.length / 2) + 1,
+    signers: publicKeys.map((publicKey) => ({
+      signature: 'ed25519',
+      publicKey: id.decode(publicKey),
+      namespace: crypto.hash(Buffer.from(namespace))
+    }))
+  }
+  const core = store.get({ manifest })
+  await core.ready()
+  const blobsCore = store.get({
+    manifest: Hyperdrive.getContentManifest(manifest, core.key)
+  })
+  await blobsCore.ready()
+  return { manifest, key: core.key, core, blobsCore }
+}
 
 function keyInput(pair, name = '') {
   return {
@@ -30,7 +53,8 @@ async function fixture(t, count = 3, options = {}) {
   await engine.ready()
   const pairs = Array.from({ length: count }, () => crypto.keyPair())
   await engine.command('profile.import', keyInput(pairs[0], 'Alice'))
-  const target = await engine.tools.createDrive(
+  const target = await createDrive(
+    engine.store,
     pairs.map((pair) => z32.encode(pair.publicKey)),
     'test/pear-pen'
   )
@@ -138,7 +162,8 @@ test('a known quorum mismatch leaves no pen, discovery or listeners and permits 
   }
   const swarm = new TrackingSwarm()
   const { engine, pairs } = await fixture(t, 3, { swarm })
-  const target = await engine.tools.createDrive(
+  const target = await createDrive(
+    engine.store,
     pairs.map((pair) => z32.encode(pair.publicKey)),
     'test/quorum-retry'
   )
@@ -257,6 +282,38 @@ test('manual requests produce interoperable signatures and commit real drive dat
   )
 })
 
+test('successive commits preserve skipped signer indices in metadata and content', async (t) => {
+  const { engine, pairs, penId, srcKey, target } = await fixture(t)
+  const source = await engine._source(srcKey)
+  for (const value of ['first update', 'second update']) {
+    const previousLength = target.core.length
+    await source.put('/app.js', Buffer.from(value))
+    const { output: request } = await engine.command('manual.request', {
+      penId,
+      srcKey
+    })
+    const req = SigningRequest.decode(z32.decode(request))
+    const result = await engine.command('manual.commit', {
+      penId,
+      request,
+      responses: [sign(request, pairs[0]), sign(request, pairs[2])],
+      confirmation: 'COMMIT'
+    })
+    assert.equal(result.committed, true)
+    assert.ok(target.core.length > previousLength)
+    assert.equal(target.core.length, req.length)
+    assert.equal(target.blobsCore.length, req.content.length)
+    for (const core of [target.core, target.blobsCore]) {
+      assert.deepEqual(
+        inflate(core.state.signature).proofs.map((proof) => proof.signer),
+        [0, 2]
+      )
+    }
+    const committed = engine.rooms.get(penId).target
+    assert.equal((await committed.get('/app.js')).toString(), value)
+  }
+})
+
 test('a different source cannot replace data covered by a signing request', async (t) => {
   const { engine, pairs, penId, srcKey, target } = await fixture(t)
   const { output: request } = await engine.command('manual.request', {
@@ -315,7 +372,8 @@ test('responses and request IDs cannot be replayed across requests or pens', asy
   )
   await engine._receive(room, forged)
   assert.deepEqual(engine.snapshot().pens[0].request.signatures, [])
-  const different = await engine.tools.createDrive(
+  const different = await createDrive(
+    engine.store,
     pairs.map((pair) => z32.encode(pair.publicKey)),
     'test/different'
   )
@@ -471,7 +529,7 @@ test('generated keys sign real requests and export backups accepted by hypercore
   assert.equal(privateExport.name, 'default')
   assert.equal(privateExport.encrypted, false)
   assert.equal(z32.decode(privateExport.key).length, 64)
-  target = await engine.tools.createDrive([publicExport.key], 'test/generated')
+  target = await createDrive(engine.store, [publicExport.key], 'test/generated')
   const source = new Hyperdrive(engine.store.namespace('generated-source'))
   await source.ready()
   await source.put('/app.js', Buffer.from('generated identity'))
@@ -785,7 +843,8 @@ test(
       }),
       /Insufficient quorum: 1 \/ 2/
     )
-    const other = await bob.tools.createDrive(
+    const other = await createDrive(
+      bob.store,
       [z32.encode(pairs[1].publicKey)],
       'test/other-quorum'
     )
@@ -1107,12 +1166,10 @@ test('a manual commit observation waits for matching metadata and content proof'
       c.decode(CoreSign.messages.Response, z32.decode(response)).signatures
   )
   const source = await engine._source(srcKey)
-  const metadata = await engine.tools.createUpdateBatch(
-    room.target.core,
-    source.core,
-    { end: req.length }
-  )
-  await engine.tools.commitUpdateBatch(
+  const metadata = await createUpdateBatch(room.target.core, source.core, {
+    end: req.length
+  })
+  await commitUpdateBatch(
     room.target.core,
     metadata,
     signatures.map((value) => value[0]),
@@ -1121,12 +1178,10 @@ test('a manual commit observation waits for matching metadata and content proof'
   await metadata.close()
   await engine.queue
   assert.equal(engine.snapshot().pens[0].request.id, requestId)
-  const content = await engine.tools.createUpdateBatch(
-    room.contentCore,
-    source.blobs.core,
-    { end: req.content.length }
-  )
-  await engine.tools.commitUpdateBatch(
+  const content = await createUpdateBatch(room.contentCore, source.blobs.core, {
+    end: req.content.length
+  })
+  await commitUpdateBatch(
     room.contentCore,
     content,
     signatures.map((value) => value[1]),

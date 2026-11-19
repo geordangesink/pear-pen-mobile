@@ -1,0 +1,4 @@
+lib/batches.js adapts the batch creation and commit operations from
+@holepunchto/multisig-tools 5.1.2 by Holepunch, licensed under Apache-2.0.
+The functions were extracted and cleanup on batch creation failure was added.
+The Apache-2.0 license is included in the application's LICENSE file.

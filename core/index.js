@@ -12,8 +12,8 @@ const crypto = require('hypercore-crypto')
 const id = require('hypercore-id-encoding')
 const CoreSign = require('hypercore-sign')
 const SigningRequest = require('hypercore-signing-request')
-const { MultisigTools } = require('@holepunchto/multisig-tools')
 const z32 = require('z32')
+const { createUpdateBatch, commitUpdateBatch } = require('./lib/batches')
 const keys = require('./lib/keys')
 const protocol = require('./lib/protocol')
 const rebuildActivity = require('./lib/activity')
@@ -83,7 +83,6 @@ class PearPen extends EventEmitter {
     if (!this.store)
       this.store = new Corestore(path.join(this.dir, 'corestore'))
     await this.store.ready()
-    this.tools = new MultisigTools(this.store)
     if (this.network && !this.swarm) this.swarm = new Hyperswarm()
     this.onConnection = (peer) => this._connection(peer)
     this.swarm?.on('connection', this.onConnection)
@@ -691,16 +690,12 @@ class PearPen extends EventEmitter {
         this._download(source.core, room.target.core.length, req.length),
         this._download(source.blobs.core, content.length, req.content.length)
       ])
-      metadataBatch = await this.tools.createUpdateBatch(
-        room.target.core,
-        source.core,
-        { end: req.length }
-      )
-      contentBatch = await this.tools.createUpdateBatch(
-        content,
-        source.blobs.core,
-        { end: req.content.length }
-      )
+      metadataBatch = await createUpdateBatch(room.target.core, source.core, {
+        end: req.length
+      })
+      contentBatch = await createUpdateBatch(content, source.blobs.core, {
+        end: req.content.length
+      })
       if (
         !b4a.equals(await metadataBatch.treeHash(), req.treeHash) ||
         !b4a.equals(await contentBatch.treeHash(), req.content.treeHash)
@@ -740,13 +735,13 @@ class PearPen extends EventEmitter {
             responses.get(z32.encode(signer.publicKey))?.decoded.signatures
         )
         if (content.length < req.content.length)
-          await this.tools.commitUpdateBatch(
+          await commitUpdateBatch(
             content,
             contentBatch,
             signatures.map((signature) => signature?.[1]),
             { length: req.content.length }
           )
-        await this.tools.commitUpdateBatch(
+        await commitUpdateBatch(
           room.target.core,
           metadataBatch,
           signatures.map((signature) => signature?.[0]),
