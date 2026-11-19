@@ -3,7 +3,7 @@
   "productName": "PearPen",
   "version": "1.0.0",
   "description": "A quiet place to sign together.",
-  "upgrade": "",
+  "upgrade": "pear://q7uqtpch8rywqos6tg7op6rq6wtbagwky81i5oa4ksdpgoq16y8o",
   "private": true,
   "main": "index.ts",
   "license": "Apache-2.0",
