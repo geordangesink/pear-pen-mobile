@@ -1,7 +1,18 @@
 gradle.beforeProject { project ->
-    project.plugins.withId('com.android.application') {
-        project.androidComponents.finalizeDsl { android ->
-            android.buildTypes.getByName('release').signingConfig = null
+    ['com.android.application', 'com.android.library'].each { plugin ->
+        project.plugins.withId(plugin) {
+            project.androidComponents.finalizeDsl { android ->
+                def architectures = project.findProperty('reactNativeArchitectures')?.split(',')?.toList()
+                if (architectures) {
+                    android.defaultConfig.ndk.abiFilters.clear()
+                    android.defaultConfig.ndk.abiFilters.addAll(architectures)
+                    def excluded = ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'] - architectures
+                    android.packaging.jniLibs.excludes.addAll(excluded.collect { "**/${it}/**".toString() })
+                }
+                if (plugin == 'com.android.application') {
+                    android.buildTypes.getByName('release').signingConfig = null
+                }
+            }
         }
     }
 }
