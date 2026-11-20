@@ -352,6 +352,23 @@ export default function DialogView({
                     <Icon name='chevron-forward' color={colors.muted} size={17} />
                   </Pressable>
                 ))}
+                <View style={[styles.row, { justifyContent: 'center', gap: 24, marginTop: 20 }]}>
+                  {[
+                    ['Privacy policy', 'https://realpainpoints.com/pear-pen/privacy'],
+                    ['Support', 'https://realpainpoints.com/pear-pen']
+                  ].map(([label, url]) => (
+                    <Pressable
+                      key={url}
+                      accessibilityRole='link'
+                      hitSlop={10}
+                      onPress={() =>
+                        void Linking.openURL(url).catch((problem) => onToast(errorMessage(problem)))
+                      }
+                    >
+                      <Text style={[styles.small, { color: colors.success }]}>{label} ↗</Text>
+                    </Pressable>
+                  ))}
+                </View>
                 <View style={styles.settingsVersion}>
                   <Image source={require('../assets/icon.png')} style={styles.versionIcon} />
                   <Text style={[styles.small, { color: colors.muted }]}>Pear Pen · {version}</Text>

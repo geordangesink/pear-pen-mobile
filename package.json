@@ -41,6 +41,7 @@
     "expo-status-bar": "~55.0.4",
     "expo-system-ui": "~55.0.10",
     "framed-stream": "^1.0.1",
+    "hypercore-sign": "3.0.0",
     "hypercore-signing-request": "4.0.2",
     "pear-mobile": "^4.3.0",
     "pear-pen-core": "file:core",
@@ -74,6 +75,7 @@
     "hypercore-signing-request": {
       "hypercore": "^11.40.3",
       "hyperdrive": "^13.3.4"
-    }
+    },
+    "sodium-native": "5.2.1"
   }
 }

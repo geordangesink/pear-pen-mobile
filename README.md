@@ -60,6 +60,8 @@ UPGRADE_KEY=pear://YOUR_DEPLOYMENT_KEY npm run update
 
 `package.json#version` is the shared native and OTA version. The `pear-runtime-react-native` Expo plugin installs native bundle selection and reload support. `pear.json#updates.minver` is the minimum native version allowed to receive the OTA payload. Native dependency changes require a new store binary and a corresponding minimum-version increase. JavaScript updates must have a strictly newer version. Configure and seed the actual deployment drive before expecting updates to arrive.
 
+`hypercore-sign` is declared at the app root so npm resolves native dependencies consistently through `file:core`. The `sodium-native` override keeps every consumer on 5.2.1 and prevents BareKit from including the older Sodium 4 Android binary, which lacks 16 KB ELF alignment.
+
 `BUILD_NUMBER` sets iOS buildNumber and Android versionCode. Android and iOS application identifiers are `com.pearpen.app`; replace them before your first store release if your organization needs another identity.
 
 ```sh
