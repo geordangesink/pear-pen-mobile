@@ -74,6 +74,8 @@ npm run build:android
 
 `build:ios` creates `dist/ios/PearPen.xcarchive` and `dist/ios/unsigned.zip`. `build:android` creates unsigned `dist/android/PearPen.apk` and `dist/android/PearPen.aab`. Both retain `build.log`. CI prepares `dist/<platform>/build-metadata.json` and exports `BUILD_NUMBER` before prebuild; the source scripts preserve that metadata and pass the unsigned artifacts to separate signing jobs. Prebuild generates native projects; it does not require or import signing credentials.
 
+iOS prebuild declares non-exempt encryption in `Info.plist`. When Apple issues a compliance code for Pear Pen, set `IOS_EXPORT_COMPLIANCE_CODE` before running `npm run prebuild -- --platform ios --no-install` to include it in local native builds.
+
 For local device development with native signing handled by the platform tools:
 
 ```sh

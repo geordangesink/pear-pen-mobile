@@ -9,7 +9,8 @@
     "plugins": [
       ["pear-runtime-react-native"],
       ["expo-build-properties", { "android": { "minSdkVersion": 29 } }],
-      "expo-document-picker"
+      "expo-document-picker",
+      "./plugins/with-export-compliance-code"
     ],
     "splash": {
       "image": "./assets/splash-icon.png",
@@ -19,6 +20,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.pearpen.app",
+      "infoPlist": { "ITSAppUsesNonExemptEncryption": true },
       "associatedDomains": ["webcredentials:realpainpoints.com"]
     },
     "android": {
