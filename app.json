@@ -20,7 +20,6 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.pearpen.app",
-      "infoPlist": { "ITSAppUsesNonExemptEncryption": true },
       "associatedDomains": ["webcredentials:realpainpoints.com"]
     },
     "android": {

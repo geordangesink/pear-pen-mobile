@@ -15,11 +15,11 @@ import { SafeAreaView } from 'react-native-safe-area-context'
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
 import { call, errorMessage, type Pen, type State } from './client'
-import { Action, Field, Icon, KeyCredentials, Segments, type Palette } from './ui'
+import { Action, Field, Icon, KeyCredentials, RoomDetails, Segments, type Palette } from './ui'
 import { styles } from './styles'
 
 type Document = Record<string, any>
-type Preview = { config: string; multisigKey: string; changed: boolean }
+type Preview = { config: string; multisigKey: string; suggestedName: string; changed: boolean }
 
 function object(value: unknown): value is Document {
   return !!value && typeof value === 'object' && !Array.isArray(value)
@@ -40,7 +40,7 @@ export default function Configuration({
   pen,
   creating,
   profile,
-  initialName = '',
+  initialName,
   colors,
   onClose,
   onSaved
@@ -54,7 +54,7 @@ export default function Configuration({
   onSaved: (penId: string) => void
 }) {
   const link = pen ? `pear://${pen.multisigKey}` : ''
-  const [name, setName] = useState(pen && pen.name !== link ? pen.name : initialName)
+  const [name, setName] = useState(initialName ?? pen?.customName ?? '')
   const [draft, setDraft] = useState(
     pen ? '' : JSON.stringify({ multisig: { namespace: '', quorum: 1, publicKeys: [''] } }, null, 2)
   )
@@ -69,6 +69,9 @@ export default function Configuration({
   const mismatch =
     !!pen && !!preview && (preview.changed || preview.multisigKey !== pen.multisigKey)
   const document = parse(draft)
+  const namespace = document?.multisig?.namespace
+  const suggestedName =
+    preview?.suggestedName || (typeof namespace === 'string' && namespace.trim())
   const sectionName =
     object(document?.manifest) && !object(document?.multisig) ? 'manifest' : 'multisig'
   const recipe = sectionName === 'multisig'
@@ -227,15 +230,10 @@ export default function Configuration({
                   Invitees receive this configuration after they prove they are one of its signers.
                 </Text>
               )}
-              <Field
-                label='PEN NAME · OPTIONAL'
-                placeholder={link || 'Defaults to the drive link'}
-                value={name}
-                onChange={setName}
-                colors={colors}
-                editable={!busy}
-              />
-              <View style={{ marginTop: 24 }}>
+              <View>
+                <Text style={[styles.sectionLabel, { color: colors.muted }]}>
+                  MULTISIG CONFIGURATION
+                </Text>
                 <Segments
                   items={['fields', 'JSON']}
                   value={mode}
@@ -410,13 +408,25 @@ export default function Configuration({
               )}
               {preview && !mismatch && needsPassword && (
                 <KeyCredentials
-                  username={profile.username || profile.name || profile.publicKey}
+                  username={profile.name}
                   password={password}
                   onChange={setPassword}
                   colors={colors}
                   busy={busy}
                 />
               )}
+              <RoomDetails
+                value={name}
+                onChange={setName}
+                placeholder={
+                  suggestedName ||
+                  link ||
+                  (preview && `pear://${preview.multisigKey}`) ||
+                  'From room namespace'
+                }
+                colors={colors}
+                editable={!busy}
+              />
               {!!error && (
                 <Text
                   accessibilityLiveRegion='polite'

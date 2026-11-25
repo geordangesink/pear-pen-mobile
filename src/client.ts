@@ -30,6 +30,7 @@ export type Pen = {
   privateRoom: boolean
   id: string
   name: string
+  customName: string
   image?: string | null
   multisigKey: string
   quorum: number
@@ -61,7 +62,7 @@ export type SavedDialog = OutputOptions & {
   text: string
 }
 export type State = {
-  profile: null | { name: string; username?: string; publicKey: string; encrypted: boolean }
+  profile: null | { name: string; publicKey: string; encrypted: boolean }
   suggestedName: string | null
   settings: { theme: 'system' | 'light' | 'dark'; mode: 'automatic' | 'manual' }
   pens: Pen[]

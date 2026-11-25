@@ -145,11 +145,11 @@ export default function Detail({
             const authorName = !entry.author
               ? 'Pear Pen'
               : mine
-                ? state.profile!.name || entry.authorName || 'You'
+                ? state.profile!.name || 'You'
                 : entry.authorName || 'Signer'
             const sharedByName =
               entry.sharedBy === state.profile!.publicKey
-                ? state.profile!.name || entry.sharedByName || 'You'
+                ? state.profile!.name || 'You'
                 : entry.sharedByName || 'Signer'
             return (
               <View key={entry.id} style={[styles.activityRow, mine && styles.activityMine]}>

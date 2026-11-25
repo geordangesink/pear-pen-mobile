@@ -15,9 +15,9 @@ Development works with an empty `upgrade` field and disables OTA updates. `npm r
 
 ## Use
 
-Keep the suggested username or enter your own, then create a password. Pear Pen encrypts the new private signing key with this password and asks for it each time you sign. The username saved with your password stays the same when you edit your display name. Back up the private key and its password. To import an existing key, expand **Import keys** and paste or select the private key, optionally with its public key. Import accepts raw Ed25519 keys and encrypted `hypercore-sign` v3 and v4 backups. Export preserves the imported file format and password. Newly generated backups use the v3-compatible format.
+Keep the suggested username or enter your own, then create a password. Pear Pen encrypts the new private signing key with this password and asks for it each time you sign. Password prompts use your current profile name for autofill. Back up the private key and its password. To import an existing key, expand **Import keys** and paste or select the private key, optionally with its public key. Import accepts raw Ed25519 keys and encrypted `hypercore-sign` v3 and v4 backups. Export preserves the imported file format and password. Newly generated backups use the v3-compatible format.
 
-Choose **Add pen → Create** and paste or import the multisig configuration. Pear Pen checks that your signing key belongs to its signer list and derives the drive link. To invite another signer, open **Pen details → Invite a signer** and keep Pear Pen online. The recipient chooses **Add pen → Join** and pastes the invite. It expires after ten minutes. Joining requires proof from a signing key listed in the configuration. Unlock an encrypted key with its password on your own device.
+Choose **Add pen → Create** and paste or import the multisig configuration. The pen name defaults to `multisig.namespace`, or to the drive link when the configuration has no namespace. You can enter a custom name. Pear Pen checks that your signing key belongs to its signer list and derives the drive link. To invite another signer, open **Pen details → Invite a signer** and keep Pear Pen online. The recipient chooses **Add pen → Join** and pastes the invite. It expires after ten minutes. Joining requires proof from a signing key listed in the configuration. Unlock an encrypted key with its password on your own device.
 
 Earlier link-only pens retain their local signing history. Create or join a private room for that drive to resume sharing activity. The new room has its own history.
 
@@ -74,7 +74,7 @@ npm run build:android
 
 `build:ios` creates `dist/ios/PearPen.xcarchive` and `dist/ios/unsigned.zip`. `build:android` creates unsigned `dist/android/PearPen.apk` and `dist/android/PearPen.aab`. Both retain `build.log`. CI prepares `dist/<platform>/build-metadata.json` and exports `BUILD_NUMBER` before prebuild; the source scripts preserve that metadata and pass the unsigned artifacts to separate signing jobs. Prebuild generates native projects; it does not require or import signing credentials.
 
-iOS prebuild declares non-exempt encryption in `Info.plist`. When Apple issues a compliance code for Pear Pen, set `IOS_EXPORT_COMPLIANCE_CODE` before running `npm run prebuild -- --platform ios --no-install` to include it in local native builds.
+Until Apple issues a compliance code for Pear Pen, complete the encryption questionnaire in App Store Connect for each new build. Once approved, set `IOS_EXPORT_COMPLIANCE_CODE` before running `npm run prebuild -- --platform ios --no-install`. Prebuild includes the code and declares non-exempt encryption in `Info.plist`.
 
 For local device development with native signing handled by the platform tools:
 

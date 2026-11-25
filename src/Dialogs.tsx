@@ -26,7 +26,7 @@ import ManualSigning, { type ManualAction } from './ManualSigning'
 import Configuration from './Configuration'
 import PenAvatar from './PenAvatar'
 import { choosePenImage } from './pen-images'
-import { Action, Field, Icon, KeyCredentials, Segments, type Palette } from './ui'
+import { Action, Field, Icon, KeyCredentials, RoomDetails, Segments, type Palette } from './ui'
 import { styles } from './styles'
 import { version } from '../package.json'
 
@@ -122,9 +122,7 @@ export default function DialogView({
         kind === 'review' ||
         kind === 'commit'))
   const [name, setName] = useState(
-    dialog.kind === 'settings'
-      ? state.profile!.name
-      : (dialog.name ?? (pen && pen.name !== `pear://${pen.multisigKey}` ? pen.name : ''))
+    dialog.kind === 'settings' ? state.profile!.name : (dialog.name ?? pen?.customName ?? '')
   )
   const [editing, setEditing] = useState(false)
   const [exportKind, setExportKind] = useState<'public' | 'private' | null>(null)
@@ -402,14 +400,6 @@ export default function DialogView({
                   multiline
                   editable={!busy}
                 />
-                <Field
-                  label='PEN NAME · OPTIONAL'
-                  value={name}
-                  onChange={setName}
-                  placeholder='Defaults to the drive link'
-                  colors={colors}
-                  editable={!busy}
-                />
               </>
             )}
             {kind === 'invite' && (
@@ -461,7 +451,10 @@ export default function DialogView({
                 ) : (
                   <Pressable
                     accessibilityLabel='Edit your name'
-                    onPress={() => setEditing(true)}
+                    onPress={() => {
+                      setName(state.profile!.name)
+                      setEditing(true)
+                    }}
                     style={[styles.nameRow, { borderBottomColor: colors.line }]}
                   >
                     <Text style={[styles.settingsName, { color: colors.ink }]}>
@@ -750,13 +743,20 @@ export default function DialogView({
             )}
             {needsPassword && (
               <KeyCredentials
-                username={
-                  state.profile!.username || state.profile!.name || state.profile!.publicKey
-                }
+                username={state.profile!.name}
                 password={password}
                 onChange={setPassword}
                 colors={colors}
                 busy={busy}
+              />
+            )}
+            {kind === 'join' && (
+              <RoomDetails
+                value={name}
+                onChange={setName}
+                placeholder={pen && !pen.customName ? pen.name : 'From room namespace'}
+                colors={colors}
+                editable={!busy}
               />
             )}
             {kind === 'output' && !reviewed && (

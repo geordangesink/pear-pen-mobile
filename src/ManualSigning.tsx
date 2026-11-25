@@ -255,7 +255,7 @@ export default function ManualSigning({
     } else {
       input = (
         <KeyCredentials
-          username={profile.username || profile.name || profile.publicKey}
+          username={profile.name}
           password={password}
           onChange={setPassword}
           colors={colors}

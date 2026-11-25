@@ -162,12 +162,16 @@ export function KeyCredentials({
 }) {
   return (
     <>
-      <Field
-        label='USERNAME'
+      <TextInput
         value={username}
-        colors={colors}
         autoComplete='username'
+        importantForAutofill='yes'
         editable={false}
+        accessible={false}
+        accessibilityElementsHidden
+        importantForAccessibility='no-hide-descendants'
+        pointerEvents='none'
+        style={styles.autofillUsername}
       />
       <Field
         label='KEY PASSWORD'
@@ -180,6 +184,25 @@ export function KeyCredentials({
         secure
       />
     </>
+  )
+}
+
+export function RoomDetails(
+  props: Pick<
+    React.ComponentProps<typeof Field>,
+    'value' | 'onChange' | 'placeholder' | 'colors' | 'editable'
+  >
+) {
+  return (
+    <View style={[styles.roomDetails, { borderTopColor: props.colors.line }]}>
+      <View style={styles.between}>
+        <Text accessibilityRole='header' style={[styles.body, { color: props.colors.ink }]}>
+          Room details
+        </Text>
+        <Text style={[styles.small, { color: props.colors.muted }]}>Optional</Text>
+      </View>
+      <Field label='PEN NAME' {...props} />
+    </View>
   )
 }
 

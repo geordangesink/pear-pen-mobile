@@ -201,6 +201,8 @@ export const styles = StyleSheet.create({
   },
   exportLoading: { paddingVertical: 35 },
   field: { marginTop: 17, gap: 8 },
+  roomDetails: { borderTopWidth: StyleSheet.hairlineWidth, marginTop: 24, paddingTop: 17 },
+  autofillUsername: { position: 'absolute', width: 1, height: 1, opacity: 0 },
   fieldLabel: { fontSize: 9, fontWeight: '600', letterSpacing: 1.2 },
   input: {
     minHeight: 50,
