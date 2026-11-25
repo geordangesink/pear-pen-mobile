@@ -16,7 +16,11 @@
       "resizeMode": "contain",
       "backgroundColor": "#25262c"
     },
-    "ios": { "supportsTablet": true, "bundleIdentifier": "com.pearpen.app" },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.pearpen.app",
+      "associatedDomains": ["webcredentials:realpainpoints.com"]
+    },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",

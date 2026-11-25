@@ -9,11 +9,14 @@ export type Activity = {
   type: string
   text: string
   author: string
+  authorName?: string
   at: number
   request?: string
   response?: string
   sharedBy?: string
+  sharedByName?: string
 }
+export type SignatureVerification = { response: string; request: string; publicKey: string }
 export type SigningRequest = {
   id: string
   srcKey: string
@@ -26,6 +29,7 @@ export type SigningRequest = {
 export type Pen = {
   id: string
   name: string
+  image?: string | null
   multisigKey: string
   quorum: number
   configuredQuorum: number | null
@@ -35,9 +39,16 @@ export type Pen = {
   request: SigningRequest | null
   activity: Activity[]
 }
-export type SavedDialog = { kind: 'output'; title: string; text: string }
+
+export function knownQuorum(pen: Pen) {
+  if (!pen.signers.length) return 0
+  return pen.request?.quorum || pen.quorum
+}
+
+export type SavedDialog = { kind: 'output'; title: string; text: string; details?: string }
 export type State = {
-  profile: null | { name: string; publicKey: string; encrypted: boolean }
+  profile: null | { name: string; username?: string; publicKey: string; encrypted: boolean }
+  suggestedName: string | null
   settings: { theme: 'system' | 'light' | 'dark'; mode: 'automatic' | 'manual' }
   pens: Pen[]
   dialog: SavedDialog | null
@@ -50,6 +61,7 @@ const pending = new Map<
     resolve: (value: any) => void
     reject: (error: unknown) => void
     timer: ReturnType<typeof setTimeout>
+    refresh: () => void
   }
 >()
 let serial = 0
@@ -84,6 +96,10 @@ function start() {
   pipe.on('data', (bytes) => {
     try {
       const message = JSON.parse(b4a.toString(bytes))
+      if (message.type === 'progress') {
+        for (const request of pending.values()) request.refresh()
+        return
+      }
       if (message.type === 'state') {
         state = message.state
         failure = ''
@@ -133,18 +149,37 @@ export function call(method: string, params: Record<string, unknown> = {}): Prom
   return new Promise((resolve, reject) => {
     if (!pipe) return reject(new Error('The signing service is starting.'))
     const id = ++serial
-    const timer = setTimeout(() => {
+    const expire = () => {
       takeRequest(id)?.reject(
         new Error('This is taking longer than expected. Check your connection and try again.')
       )
-    }, 120000)
-    pending.set(id, { resolve, reject, timer })
+    }
+    const request = {
+      resolve,
+      reject,
+      timer: setTimeout(expire, 120000),
+      refresh: () => {
+        clearTimeout(request.timer)
+        request.timer = setTimeout(expire, 120000)
+      }
+    }
+    pending.set(id, request)
     try {
       pipe.write(JSON.stringify({ id, method, params }))
     } catch (error) {
       takeRequest(id)?.reject(error)
     }
   })
+}
+
+export async function verifySignature(
+  penId: string,
+  signature: SignatureVerification
+): Promise<string> {
+  const result = await call('manual.verify', { penId, ...signature })
+  if (result?.verified !== true || typeof result.output !== 'string')
+    throw new Error('The signature could not be verified.')
+  return result.output
 }
 
 export const client = {

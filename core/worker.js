@@ -36,6 +36,7 @@ function updateError(error) {
 
 engine.on('state', (state) => send({ type: 'state', state }))
 engine.on('warning', (message) => send({ type: 'warning', message }))
+engine.on('progress', () => send({ type: 'progress' }))
 
 async function start() {
   await engine.ready()

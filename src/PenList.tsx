@@ -1,17 +1,28 @@
 import { Pressable, ScrollView, Text, View } from 'react-native'
-import type { Pen, State } from './client'
+import { knownQuorum, type Pen, type State } from './client'
+import PenAvatar from './PenAvatar'
 import { Icon, type Palette } from './ui'
 import { styles } from './styles'
+
+function penSummary(pen: Pen) {
+  if (!pen.request) return pen.activity.at(-1)?.text || 'No open request'
+  const quorum = knownQuorum(pen)
+  return quorum > 0
+    ? `${pen.request.signatures.length}/${quorum} signatures · Request open`
+    : 'Request open'
+}
 
 export default function PenList({
   state,
   colors,
   onOpen,
+  onDetails,
   onAdd
 }: {
   state: State
   colors: Palette
   onOpen: (pen: Pen) => void
+  onDetails: (pen: Pen) => void
   onAdd: () => void
 }) {
   return (
@@ -23,40 +34,38 @@ export default function PenList({
       <ScrollView contentContainerStyle={state.pens.length ? styles.list : styles.emptyScroll}>
         {state.pens.length ? (
           state.pens.map((pen) => (
-            <Pressable
-              accessibilityRole='button'
-              key={pen.id}
-              onPress={() => onOpen(pen)}
-              style={({ pressed }) => [
-                styles.penRow,
-                { opacity: pressed ? 0.6 : 1, borderBottomColor: colors.line }
-              ]}
-            >
-              <View style={[styles.penAvatar, { backgroundColor: colors.soft }]}>
-                <Icon name='pencil-outline' color={colors.success} size={25} />
-              </View>
-              <View style={styles.penInfo}>
-                <View style={styles.row}>
+            <View key={pen.id} style={[styles.penRow, { borderBottomColor: colors.line }]}>
+              <Pressable
+                accessibilityRole='button'
+                accessibilityLabel={`Open ${pen.name}`}
+                onPress={() => onOpen(pen)}
+                style={({ pressed }) => [styles.penOpen, { opacity: pressed ? 0.6 : 1 }]}
+              >
+                <PenAvatar image={pen.image} colors={colors} />
+                <View style={styles.penInfo}>
                   <Text numberOfLines={1} style={[styles.penTitle, { color: colors.ink }]}>
                     {pen.name}
                   </Text>
-                  {pen.request && (
-                    <View style={[styles.dot, { backgroundColor: colors.success }]} />
+                  <Text numberOfLines={1} style={[styles.small, { color: colors.muted }]}>
+                    {penSummary(pen)}
+                  </Text>
+                  {pen.quorumMismatch && state.settings.mode === 'manual' && (
+                    <Text style={[styles.quorumNote, { color: colors.muted }]}>
+                      Drive quorum is {pen.quorum} (entered {pen.configuredQuorum}).
+                    </Text>
                   )}
                 </View>
-                <Text numberOfLines={1} style={[styles.small, { color: colors.muted }]}>
-                  {pen.request
-                    ? `${pen.request.signatures.length}/${pen.request.quorum || pen.quorum} signatures · Request open`
-                    : pen.activity.at(-1)?.text || 'No open request'}
-                </Text>
-                {pen.quorumMismatch && state.settings.mode === 'manual' && (
-                  <Text style={[styles.quorumNote, { color: colors.muted }]}>
-                    Drive quorum is {pen.quorum} (entered {pen.configuredQuorum}).
-                  </Text>
-                )}
-              </View>
-              <Icon name='chevron-forward' color={colors.muted} size={17} />
-            </Pressable>
+              </Pressable>
+              <Pressable
+                accessibilityRole='button'
+                accessibilityLabel={`Details for ${pen.name}`}
+                onPress={() => onDetails(pen)}
+                hitSlop={2}
+                style={styles.iconButton}
+              >
+                <Icon name='information-circle-outline' color={colors.muted} size={22} />
+              </Pressable>
+            </View>
           ))
         ) : (
           <View style={styles.empty}>

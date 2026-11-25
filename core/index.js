@@ -2,7 +2,6 @@ const EventEmitter = require('events')
 const fs = require('fs')
 const path = require('path')
 const b4a = require('b4a')
-const c = require('compact-encoding')
 const Corestore = require('corestore')
 const Hyperdrive = require('hyperdrive')
 const Hypercore = require('hypercore')
@@ -10,14 +9,28 @@ const Hyperswarm = require('hyperswarm')
 const Protomux = require('protomux')
 const crypto = require('hypercore-crypto')
 const id = require('hypercore-id-encoding')
-const CoreSign = require('hypercore-sign')
+const CoreSign = require('hypercore-sign-v4')
 const SigningRequest = require('hypercore-signing-request')
 const z32 = require('z32')
-const { createUpdateBatch, commitUpdateBatch } = require('./lib/batches')
+const commitDrive = require('./lib/commit')
 const keys = require('./lib/keys')
 const protocol = require('./lib/protocol')
 const rebuildActivity = require('./lib/activity')
-const { MAX_MESSAGE, cleanEncoded, normalizeKey, requestHash } = protocol
+const download = require('./lib/download')
+const {
+  parseConfiguration,
+  serializeManifest,
+  emptyConfiguration,
+  configurationMismatch
+} = require('./lib/configuration')
+const {
+  MAX_MESSAGE,
+  cleanEncoded,
+  normalizeKey,
+  parseSource,
+  normalizeSource,
+  requestHash
+} = protocol
 
 class PearPen extends EventEmitter {
   constructor(options = {}) {
@@ -37,10 +50,12 @@ class PearPen extends EventEmitter {
       dialog: null
     }
     this.identity = null
+    this.suggestedName = null
     this.privateExports = new Set()
     this.rooms = new Map()
     this.drives = new Map()
     this.driveDiscoveries = new Map()
+    this.driveReady = new Map()
     this.channels = new Map()
     this.queue = Promise.resolve()
     this.closed = false
@@ -55,6 +70,12 @@ class PearPen extends EventEmitter {
   async _open() {
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 })
     this.data = readJSON(path.join(this.dir, 'state.json'), this.data)
+    if (this.data.version === undefined) {
+      for (const pen of this.data.pens) {
+        if (pen.name === 'Untitled pen') pen.name = ''
+      }
+      this.data.version = 1
+    }
     this.identity = readJSON(path.join(this.dir, 'identity.json'), null)
     if (this.identity) {
       const publicKey = keys.decode(this.identity.publicKey)
@@ -63,7 +84,7 @@ class PearPen extends EventEmitter {
           'The saved signing identity is invalid. Restore your identity backup before continuing'
         )
       const profile = {
-        name: cleanName(this.data.profile?.name),
+        name: cleanName(this.data.profile?.name ?? this.identity.username),
         publicKey: z32.encode(publicKey)
       }
       this.identity.publicKey = profile.publicKey
@@ -79,6 +100,8 @@ class PearPen extends EventEmitter {
       throw new Error(
         'Your signing identity is missing. Restore your identity backup before continuing'
       )
+    } else {
+      this.suggestedName = suggestUsername()
     }
     if (!this.store)
       this.store = new Corestore(path.join(this.dir, 'corestore'))
@@ -94,8 +117,10 @@ class PearPen extends EventEmitter {
   snapshot() {
     return JSON.parse(
       JSON.stringify({
+        suggestedName: this.suggestedName,
         profile: this.data.profile && {
           ...this.data.profile,
+          username: this.identity?.username || this.data.profile.publicKey,
           encrypted: !!this.identity?.encrypted
         },
         settings: this.data.settings,
@@ -103,8 +128,9 @@ class PearPen extends EventEmitter {
           const room = this.rooms.get(pen.id)
           return {
             id: pen.id,
-            name: pen.name,
+            name: pen.name || `pear://${pen.multisigKey}`,
             multisigKey: pen.multisigKey,
+            image: pen.image || null,
             quorum: room?.manifest?.quorum || pen.configuredQuorum || 0,
             configuredQuorum: pen.configuredQuorum ?? null,
             quorumMismatch: !!(
@@ -154,10 +180,12 @@ class PearPen extends EventEmitter {
     if (method === 'profile.import') {
       if (this.identity)
         throw new Error('A signing identity has already been imported')
-      const name = cleanName(params.name)
+      const name = cleanName(params.name) || this.suggestedName
       const identity = keys.importIdentity(params)
+      identity.username = name
       atomicJSON(path.join(this.dir, 'identity.json'), identity)
       this.identity = identity
+      this.suggestedName = null
       this.privateExports.add(identity.secretKey)
       this.data.profile = { name, publicKey: identity.publicKey }
       this._save()
@@ -196,24 +224,137 @@ class PearPen extends EventEmitter {
     }
     if (method === 'pen.add') {
       this._requireIdentity()
-      const multisigKey = normalizeKey(params.multisigKey)
-      const configuredQuorum = parseQuorum(params.quorum)
+      const configuration =
+        params.config === undefined ? null : parseConfiguration(params.config)
+      const expectedKey =
+        params.multisigKey === undefined
+          ? null
+          : normalizeKey(params.multisigKey)
+      if (
+        configuration &&
+        expectedKey &&
+        configuration.multisigKey !== expectedKey
+      )
+        throw configurationMismatch(expectedKey, configuration.multisigKey)
+      const multisigKey = configuration?.multisigKey || expectedKey
+      if (!multisigKey)
+        throw new Error('Enter a multisig link or import a configuration')
+      const configuredQuorum = configuration ? null : parseQuorum(params.quorum)
       if (this.data.pens.some((pen) => pen.multisigKey === multisigKey))
         throw new Error('This pen is already in your list')
       const pen = {
         id: multisigKey,
         multisigKey,
-        name: cleanName(params.name) || 'Untitled pen',
+        name: cleanName(params.name),
         configuredQuorum,
         drafts: {}
       }
-      await this._openPen(pen, true)
-      this.data.pens.push(pen)
-      this._save()
+      const cached = this.drives.has(multisigKey)
+      let room
+      try {
+        await this._openPen(pen, true)
+        room = this.rooms.get(pen.id)
+        if (configuration)
+          await this._installManifest(
+            room,
+            configuration.manifest,
+            configuration.config
+          )
+        this.data.pens.push(pen)
+        try {
+          this._save()
+        } catch (error) {
+          this.data.pens = this.data.pens.filter((item) => item !== pen)
+          throw error
+        }
+      } catch (error) {
+        if (room) {
+          await this._closeRoom(room)
+          this.rooms.delete(pen.id)
+          if (!cached) {
+            this.drives.delete(multisigKey)
+            await this.driveDiscoveries.get(multisigKey)?.destroy()
+            this.driveDiscoveries.delete(multisigKey)
+            await room.target.close()
+          }
+        }
+        throw error
+      }
       return this.snapshot()
+    }
+    if (method === 'pen.preview') {
+      const { config, multisigKey } = parseConfiguration(params.config)
+      const room =
+        params.penId === undefined ? null : this.rooms.get(params.penId)
+      if (params.penId !== undefined && !room) throw new Error('Pen not found')
+      const expectedKey =
+        room?.pen.multisigKey ||
+        (params.multisigKey === undefined
+          ? null
+          : normalizeKey(params.multisigKey))
+      return {
+        config,
+        multisigKey,
+        changed: !!expectedKey && multisigKey !== expectedKey
+      }
     }
     const room = this.rooms.get(params.penId)
     if (!room) throw new Error('Pen not found')
+    if (method === 'pen.configuration') {
+      return {
+        config:
+          room.pen.config ||
+          (room.manifest
+            ? JSON.stringify(
+                { manifest: serializeManifest(room.manifest) },
+                null,
+                2
+              )
+            : emptyConfiguration())
+      }
+    }
+    if (method === 'pen.image') {
+      this._requireIdentity()
+      const image = params.image
+      if (
+        image !== null &&
+        (typeof image !== 'string' ||
+          b4a.byteLength(image) > 128 * 1024 ||
+          !/^data:image\/(?:jpeg|png|webp);base64,(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)$/.test(
+            image
+          ))
+      )
+        throw new Error(
+          'Choose a JPEG, PNG or WebP image no larger than 128 KB'
+        )
+      room.pen.image = image
+      this._save()
+      return this.snapshot()
+    }
+    if (method === 'pen.configure') {
+      this._requireIdentity()
+      const { config, manifest, multisigKey } = parseConfiguration(
+        params.config
+      )
+      const name =
+        params.name === undefined ? room.pen.name : cleanName(params.name)
+      if (multisigKey !== room.pen.multisigKey)
+        throw configurationMismatch(room.pen.multisigKey, multisigKey)
+      const previous = {
+        name: room.pen.name,
+        config: room.pen.config,
+        configuredQuorum: room.pen.configuredQuorum
+      }
+      try {
+        await this._installManifest(room, manifest, config)
+        room.pen.name = name
+        this._save()
+      } catch (error) {
+        Object.assign(room.pen, previous)
+        throw error
+      }
+      return this.snapshot()
+    }
     if (method === 'pen.remove') {
       await this._closeRoom(room)
       this.rooms.delete(params.penId)
@@ -229,26 +370,63 @@ class PearPen extends EventEmitter {
       if (!response) throw new Error('You have not signed this request')
       return { output: response }
     }
-    await this._manifest(room, true)
-    this._requireSigner(room)
-    if (method === 'manual.request' || method === 'request.create') {
-      const srcKey = normalizeKey(params.srcKey)
-      const request = await this._makeRequest(room, srcKey)
-      room.pen.drafts[request] = srcKey
-      this._save()
-      if (
-        method !== 'manual.request' ||
-        room.current?.status !== 'open' ||
-        room.current.request !== request ||
-        room.current.srcKey !== srcKey
+    if (method === 'manual.verify') {
+      const request = cleanEncoded(params.request)
+      const response = cleanEncoded(params.response)
+      const key =
+        typeof params.publicKey === 'string' ? params.publicKey.trim() : ''
+      if (key.includes('/') || !id.isValid(key))
+        throw new Error(
+          'Enter the expected signer’s public key in z-base-32 or hex'
+        )
+      const signer = id.normalize(key)
+      const req = this._requestManifest(room, request)
+      CoreSign.verify(
+        z32.decode(response),
+        z32.decode(request),
+        id.decode(signer)
       )
-        await this._publish(room, { type: 'request', srcKey, request })
-      if (method === 'manual.request') return { output: request }
-      return this.snapshot()
+      const details = requestDetails(req, 'hex')
+      const output = [
+        'Signature verified.',
+        `Signer: ${signer}`,
+        `Multisig key: ${details.key}`,
+        `Fork: ${details.fork}`,
+        `Metadata length: ${details.length}`,
+        `Metadata tree hash: ${details.treeHash}`,
+        `Content length: ${details.content.length}`,
+        `Content tree hash: ${details.content.treeHash}`
+      ].join('\n')
+      return { verified: true, signer, details, output }
+    }
+    const creatingRequest =
+      method === 'manual.request' || method === 'request.create'
+    const manualRelease =
+      method === 'manual.review' || method === 'manual.commit'
+    const manualDestination =
+      (method === 'manual.request' &&
+        (params.multisigKey !== undefined || params.length !== undefined)) ||
+      (manualRelease &&
+        (params.multisigKey !== undefined || params.request === undefined))
+    if (
+      manualDestination &&
+      normalizeKey(params.multisigKey) !== room.pen.multisigKey
+    )
+      throw new Error(
+        'The destination multisig drive key does not match this pen'
+      )
+    if (method === 'manual.inspect') {
+      this._requireIdentity()
+      const request = cleanEncoded(params.request)
+      const req = this._requestManifest(room, request)
+      SigningRequest.signable(id.decode(this.identity.publicKey), req)
+      return { ...requestDetails(req, 'hex'), signer: this.identity.publicKey }
     }
     if (method === 'manual.response') {
       const request = cleanEncoded(params.request)
-      this._parseRequest(room, request)
+      const req = this._requestManifest(room, request)
+      this._requireSigner(req.manifest)
+      if (room.target.core.manifest) await this._manifest(room, true)
       const record = this._findRequest(room, request)
       const existing =
         record?.responses.get(this.identity.publicKey) ||
@@ -262,6 +440,7 @@ class PearPen extends EventEmitter {
           )?.response)
       if (existing) return { output: existing }
       const response = await this._sign(room, request, params.password)
+      if (!room.manifest) await this._installManifest(room, req.manifest)
       await this._publish(room, {
         type: 'response',
         request,
@@ -271,17 +450,89 @@ class PearPen extends EventEmitter {
       })
       return { output: response }
     }
-    if (method === 'manual.review' || method === 'manual.commit') {
-      const request = cleanEncoded(params.request)
+    let srcKey = creatingRequest ? normalizeSource(params.srcKey) : null
+    let length = null
+    if (method === 'manual.request' && manualDestination) {
+      length = manualLength(params.length)
+      const pin = parseSource(srcKey)
+      if (pin.length !== null && length !== pin.length)
+        throw new Error('The length must match the versioned source link')
+    }
+    if (creatingRequest && parseSource(srcKey).key === room.pen.multisigKey)
+      throw new Error('Choose a source drive different from the multisig drive')
+    let source
+    if (creatingRequest && !room.target.core.manifest) {
+      source = await this._source(srcKey, length)
+      srcKey = pinnedSource(srcKey, source, length)
+      await this._bootstrapManifest(room, srcKey, source)
+    }
+    if (!room.target.core.manifest && manualRelease && params.request) {
+      const req = this._requestManifest(room, cleanEncoded(params.request))
+      await this._installManifest(room, req.manifest)
+    }
+    await this._manifest(room, true)
+    this._requireSigner(room.manifest)
+    if (creatingRequest) {
+      source ||= await this._source(srcKey, length)
+      srcKey = pinnedSource(srcKey, source, length)
+      const request = await this._makeRequest(room, srcKey, source)
+      room.pen.drafts[request] = srcKey
+      this._save()
+      if (
+        method !== 'manual.request' ||
+        room.current?.status !== 'open' ||
+        room.current.request !== request ||
+        room.current.srcKey !== srcKey
+      )
+        await this._publish(room, { type: 'request', srcKey, request })
+      if (method === 'manual.request')
+        return {
+          output: request,
+          details: requestDetails(this._parseRequest(room, request))
+        }
+      return this.snapshot()
+    }
+    if (method === 'manual.submitResponse') {
+      const record = room.current
+      if (!record || record.status !== 'open')
+        throw new Error('There is no open request')
+      const response = cleanEncoded(params.response)
+      const verified = await this._responses(room, record.request, [response])
+      const signer = verified.keys().next().value
+      if (!record.responses.has(signer))
+        await this._publish(room, {
+          type: 'response',
+          requestId: record.id,
+          request: record.request,
+          requestHash: record.hash,
+          signer,
+          response
+        })
+      const responses = room.requests.get(record.id).responses
+      const result = {
+        quorum: responses.size,
+        required: record.req.manifest.quorum,
+        signers: signerStatus(record.req, responses),
+        request: requestDetails(record.req)
+      }
+      return { ...result, output: JSON.stringify(result, null, 2) }
+    }
+    if (manualRelease) {
+      const stored =
+        params.request === undefined
+          ? this._currentRequest(room, params.requestId)
+          : null
+      const request = stored?.request || cleanEncoded(params.request)
       this._parseRequest(room, request)
-      const record = this._findRequest(room, request)
+      const record = stored || this._findRequest(room, request)
       const srcKey = params.srcKey
-        ? normalizeKey(params.srcKey)
+        ? normalizeSource(params.srcKey)
         : record?.srcKey || room.pen.drafts[request]
       if (!srcKey)
         throw new Error('Enter the source key for this signing request')
-      if (method === 'manual.commit' && params.confirmation !== 'COMMIT')
-        throw new Error('Type COMMIT to confirm')
+      const confirmation = manualDestination ? 'CONFIRM' : 'COMMIT'
+      if (method === 'manual.commit' && params.confirmation !== confirmation)
+        throw new Error(`Type ${confirmation} to confirm`)
       const pasted = await this._responses(
         room,
         request,
@@ -294,7 +545,8 @@ class PearPen extends EventEmitter {
         room,
         { request, srcKey },
         [...responses.values()],
-        method === 'manual.commit'
+        method === 'manual.commit',
+        manualDestination
       )
       const payload = {
         request,
@@ -317,15 +569,10 @@ class PearPen extends EventEmitter {
       })
       return { ...result, output: JSON.stringify(result, null, 2) }
     }
-    const current = room.current
-    if (!current || current.status !== 'open')
-      throw new Error('There is no open request')
-    if (params.requestId !== current.id)
-      throw new Error('The request changed. Review the current request again')
+    const current = this._currentRequest(room, params.requestId)
     if (method === 'request.sign') {
       if (current.responses.has(this.identity.publicKey))
         throw new Error('You have already signed this request')
-      await this._review(room, current, [], false)
       const response = await this._sign(room, current.request, params.password)
       await this._publish(room, {
         type: 'response',
@@ -368,10 +615,19 @@ class PearPen extends EventEmitter {
     if (!this.identity) throw new Error('Import your signing keys first')
   }
 
-  _requireSigner(room) {
+  _currentRequest(room, requestId) {
+    const current = room.current
+    if (!current || current.status !== 'open')
+      throw new Error('There is no open request')
+    if (requestId !== current.id)
+      throw new Error('The request changed. Review the current request again')
+    return current
+  }
+
+  _requireSigner(manifest) {
     this._requireIdentity()
     if (
-      !room.manifest.signers.some(
+      !manifest.signers.some(
         (signer) => z32.encode(signer.publicKey) === this.identity.publicKey
       )
     )
@@ -384,20 +640,80 @@ class PearPen extends EventEmitter {
     let drive
     try {
       drive = new Hyperdrive(store, id.decode(key))
-      drive.core.timeout = this.timeout
       await drive.ready()
       const discovery = this.swarm?.join(drive.discoveryKey, {
         client: true,
         server: true
       })
       this.drives.set(key, drive)
-      if (discovery) this.driveDiscoveries.set(key, discovery)
+      if (discovery) {
+        this.driveDiscoveries.set(key, discovery)
+        this._discover(key, drive, discovery)
+      }
       return drive
     } catch (error) {
       if (drive) await drive.close()
       else await store.close()
       throw error
     }
+  }
+
+  _discover(key, drive, discovery, refresh = false) {
+    if (this.driveReady.has(key)) return this.driveReady.get(key)
+    const done = drive.core.findingPeers()
+    let resolveDiscovery
+    const ready = new Promise((resolve) => {
+      resolveDiscovery = resolve
+    })
+    this.driveReady.set(key, ready)
+    let finished = false
+    let running = false
+    let again = false
+    const finish = (success = false) => {
+      if (finished) return
+      finished = true
+      clearTimeout(timer)
+      drive.off('close', finish)
+      this.swarm.off('connection', retry)
+      done()
+      this.driveReady.delete(key)
+      resolveDiscovery(success)
+    }
+    const timer = setTimeout(finish, this.timeout)
+    timer.unref?.()
+    drive.once('close', finish)
+    const attempt = () => {
+      if (finished) return
+      if (running) {
+        again = true
+        return
+      }
+      running = true
+      Promise.resolve()
+        .then(async () => {
+          if (refresh && (await discovery.refresh?.()) === false) return false
+          if ((await discovery.flushed()) === false) return false
+          if ((await this.swarm.flush?.()) === false) return false
+          return true
+        })
+        .catch(() => false)
+        .then((success) => {
+          running = false
+          if (finished) return
+          if (success) return finish(true)
+          if (again) {
+            again = false
+            attempt()
+          }
+        })
+    }
+    const retry = () => {
+      refresh = true
+      attempt()
+    }
+    this.swarm.on('connection', retry)
+    attempt()
+    return ready
   }
 
   async _openPen(pen, validateQuorum = false) {
@@ -444,7 +760,7 @@ class PearPen extends EventEmitter {
       const refresh = () => {
         this.queue = this.queue
           .then(async () => {
-            if (this.closed || !this.rooms.has(pen.id)) return
+            if (this.closed || this.rooms.get(pen.id) !== room) return
             await this._manifest(room)
             await this._rebuild(room)
             this._emit()
@@ -474,39 +790,33 @@ class PearPen extends EventEmitter {
   }
 
   async _closeRoom(room) {
+    room.closed = true
     if (room.refresh) {
       room.target.core.off('manifest', room.refresh)
       room.target.core.off('append', room.refresh)
       room.contentCore?.off('append', room.refresh)
     }
-    for (const channel of room.channels) channel.close()
+    for (const [key, channel] of this.channels) {
+      if (!key.startsWith(`${room.pen.id}:`)) continue
+      this.channels.delete(key)
+      channel.close()
+    }
     await room.discovery?.destroy()
     await room.contentCore?.close()
   }
 
   async _manifest(room, required = false) {
     if (!room.target.core.manifest && required)
-      await room.target.core.update({ wait: true, timeout: this.timeout })
+      await this._update(room.target.core, 'manifest')
     const manifest = room.target.core.manifest
     if (!manifest) {
       if (required)
         throw new Error(
-          'The multisig drive is offline. Keep a peer seeding it and try again'
+          'The multisig drive manifest is unavailable. Import its pear.json in Pen details, or keep a peer seeding the complete drive and try again'
         )
       return
     }
-    if (
-      manifest.version !== 1 ||
-      !b4a.equals(Hypercore.key(manifest), id.decode(room.pen.multisigKey)) ||
-      manifest.quorum < 1 ||
-      manifest.quorum > manifest.signers.length ||
-      new Set(
-        manifest.signers.map((signer) => signer.publicKey.toString('hex'))
-      ).size !== manifest.signers.length
-    )
-      throw new Error(
-        'This key does not have a supported multisig drive manifest'
-      )
+    this._validateManifest(room, manifest)
     const firstManifest = !room.manifest
     room.manifest = manifest
     if (!room.contentCore) {
@@ -528,13 +838,115 @@ class PearPen extends EventEmitter {
     }
   }
 
-  async _source(key) {
-    const drive = await this._drive(key)
-    if (!drive.core.length)
-      await drive.core.update({ wait: true, timeout: this.timeout })
+  _validateManifest(room, manifest) {
+    if (
+      manifest.version !== 1 ||
+      !b4a.equals(Hypercore.key(manifest), id.decode(room.pen.multisigKey)) ||
+      manifest.quorum < 1 ||
+      manifest.quorum > manifest.signers.length ||
+      new Set(
+        manifest.signers.map((signer) => signer.publicKey.toString('hex'))
+      ).size !== manifest.signers.length
+    )
+      throw new Error(
+        'This key does not have a supported multisig drive manifest'
+      )
+  }
+
+  async _installManifest(room, manifest, config) {
+    if (!b4a.equals(Hypercore.key(manifest), id.decode(room.pen.multisigKey)))
+      throw configurationMismatch(
+        room.pen.multisigKey,
+        id.normalize(Hypercore.key(manifest))
+      )
+    const core = room.target.corestore.get({ key: room.target.key, manifest })
+    try {
+      await core.ready()
+    } finally {
+      await core.close()
+    }
+    await this._manifest(room, true)
+    await this._rebuild(room)
+    if (config !== undefined) {
+      room.pen.config = config
+      room.pen.configuredQuorum = null
+    }
+    this._emit()
+  }
+
+  async _bootstrapManifest(room, srcKey, source) {
+    const pin = parseSource(srcKey)
+    if (pin.key === room.pen.multisigKey)
+      throw new Error('Choose a source drive different from the multisig drive')
+    source ||= await this._source(srcKey)
+    if (room.target.core.manifest) return source
+    const view = source.checkout(pin.length ?? source.core.length)
+    try {
+      await view.ready()
+      const entry = await view.entry('/pear.json', { timeout: this.timeout })
+      if (room.target.core.manifest) return source
+      const blob = entry?.value.blob
+      if (!blob)
+        throw new Error(
+          'The source drive is missing /pear.json. Stage the public multisig configuration there, or import it in Pen details.'
+        )
+      if (!Number.isSafeInteger(blob.byteLength) || blob.byteLength > 64 * 1024)
+        throw new Error('The source /pear.json must be no larger than 64 KB')
+      await view.getBlobs()
+      const length = await view.blobs.getByteLength(blob)
+      if (!Number.isSafeInteger(length) || length < 1 || length > 64 * 1024)
+        throw new Error('The source /pear.json must be no larger than 64 KB')
+      const buffer = await view.get(entry, {
+        timeout: this.timeout,
+        length,
+        prefetch: false
+      })
+      if (!buffer || buffer.length > 64 * 1024)
+        throw new Error('The source /pear.json must be no larger than 64 KB')
+      if (room.target.core.manifest) return source
+      const { config, manifest } = parseConfiguration(b4a.toString(buffer))
+      await this._installManifest(room, manifest, config)
+      this._save()
+      return source
+    } finally {
+      await view.close()
+    }
+  }
+
+  async _source(value, length = null) {
+    const pin = parseSource(value)
+    pin.length ??= length
+    const drive = await this._drive(pin.key)
+    const available =
+      pin.length !== null &&
+      drive.core.length >= pin.length &&
+      (pin.fork === null || drive.core.fork === pin.fork)
+    if (!available) {
+      const discovery = this.driveDiscoveries.get(pin.key)
+      const discovered =
+        !discovery || (await this._discover(pin.key, drive, discovery, true))
+      if (!discovered && pin.length === null)
+        throw new Error(
+          'Could not discover the latest source version. Keep its peer online and try again, or use an exact versioned source link.'
+        )
+      const updated = await this._update(drive.core, 'length', {
+        length: Math.max(1, pin.length ?? 1),
+        fork: pin.fork,
+        peers: pin.length === null && !!this.swarm
+      })
+      if (!updated && pin.length === null)
+        throw new Error(
+          'The source drive is offline. Keep its peer online and try again'
+        )
+    }
+    if (pin.fork !== null && drive.core.fork !== pin.fork)
+      throw new Error('The requested source fork is unavailable')
+    if (pin.length !== null && drive.core.length < pin.length)
+      throw new Error('The requested source version is unavailable')
     if (!drive.core.length)
       throw new Error('The source drive is empty or offline')
     await drive.core.get(0, { timeout: this.timeout })
+    drive.core.timeout = this.timeout
     await drive.getBlobs()
     if (!drive.blobs) throw new Error('The source is not a Hyperdrive')
     drive.blobs.core.timeout = this.timeout
@@ -545,17 +957,93 @@ class PearPen extends EventEmitter {
     return drive
   }
 
-  async _makeRequest(room, srcKey) {
-    if (srcKey === room.pen.multisigKey)
+  async _update(
+    core,
+    property = 'length',
+    { length = 1, fork = null, peers = false } = {}
+  ) {
+    const session = core.session()
+    const event = property === 'manifest' ? 'manifest' : 'append'
+    let timer
+    let check
+    let update
+    let active = true
+    let running = false
+    let again = false
+    try {
+      return await new Promise((resolve, reject) => {
+        check = () => {
+          const available =
+            property === 'manifest'
+              ? !!core.manifest
+              : core.length >= length && (fork === null || core.fork === fork)
+          if (available && (!peers || core.writable || core.peers.length > 0))
+            resolve(true)
+        }
+        update = () => {
+          if (!active) return
+          if (running) {
+            again = true
+            return
+          }
+          running = true
+          session.update({ wait: true }).then(
+            () => {
+              running = false
+              if (!active) return
+              check()
+              if (again) {
+                again = false
+                update()
+              }
+            },
+            (error) => {
+              running = false
+              if (active) reject(error)
+            }
+          )
+        }
+        core.on(event, check)
+        core.on('peer-add', update)
+        timer = setTimeout(() => resolve(false), this.timeout)
+        update()
+      })
+    } finally {
+      active = false
+      clearTimeout(timer)
+      core.off(event, check)
+      core.off('peer-add', update)
+      await session.close()
+    }
+  }
+
+  async _makeRequest(room, srcKey, source) {
+    const pin = parseSource(srcKey)
+    if (pin.key === room.pen.multisigKey)
       throw new Error('Choose a source drive different from the multisig drive')
-    const source = await this._source(srcKey)
-    if (source.core.length <= room.target.core.length)
+    source ||= await this._source(srcKey)
+    const length = pin.length ?? source.core.length
+    const fork = pin.fork ?? source.core.fork
+    if (source.core.length < length)
+      throw new Error('The requested source version is unavailable')
+    if (source.core.fork !== fork)
+      throw new Error('The requested source fork is unavailable')
+    if (length <= room.target.core.length)
       throw new Error('The source has no new changes to sign')
-    if (source.core.fork !== room.target.core.fork)
+    if (fork !== room.target.core.fork)
       throw new Error('Source and multisig drive forks do not match')
-    return z32.encode(
-      await SigningRequest.generateDrive(source, { manifest: room.manifest })
-    )
+    const request = await SigningRequest.generateDrive(source, {
+      manifest: room.manifest,
+      length,
+      fork,
+      // hypercore-sign v3 compatibility: emit the request format accepted by both signer versions.
+      legacy: true
+    })
+    if (source.core.fork !== fork)
+      throw new Error(
+        'The source drive changed forks while creating the request'
+      )
+    return z32.encode(request)
   }
 
   _parseRequest(room, request) {
@@ -571,6 +1059,12 @@ class PearPen extends EventEmitter {
       throw new Error(
         'This signing request belongs to a different multisig drive'
       )
+    return req
+  }
+
+  _requestManifest(room, request) {
+    const req = this._parseRequest(room, request)
+    this._validateManifest(room, req.manifest)
     return req
   }
 
@@ -605,9 +1099,15 @@ class PearPen extends EventEmitter {
       )
         return false
       return (
-        b4a.equals(await room.target.core.treeHash(req.length), req.treeHash) &&
         b4a.equals(
-          await room.contentCore.treeHash(req.content.length),
+          await Hypercore.treeHashFromStorage(room.target.core, req.length),
+          req.treeHash
+        ) &&
+        b4a.equals(
+          await Hypercore.treeHashFromStorage(
+            room.contentCore,
+            req.content.length
+          ),
           req.content.treeHash
         )
       )
@@ -624,16 +1124,15 @@ class PearPen extends EventEmitter {
       const signatures = SigningRequest.signable(publicKey, req).map((item) =>
         crypto.sign(item.signable, secret)
       )
-      const response = z32.encode(
-        c.encode(CoreSign.messages.Response, {
-          version: req.version,
-          requestHash: crypto.hash(z32.decode(request)),
-          publicKey,
-          signatures
-        })
-      )
-      await CoreSign.verify(response, request, this.identity.publicKey)
-      return response
+      const encoded = z32.decode(request)
+      const response = SigningRequest.encodeResponse({
+        version: req.version,
+        requestHash: crypto.hash(encoded),
+        publicKey,
+        signatures
+      })
+      CoreSign.verify(response, encoded, publicKey)
+      return z32.encode(response)
     } finally {
       secret.fill(0)
     }
@@ -645,145 +1144,183 @@ class PearPen extends EventEmitter {
       values.length > room.manifest.signers.length * 2
     )
       throw new Error('Invalid signing responses')
+    const encodedRequest = z32.decode(request)
     const responses = new Map()
     for (const value of values) {
       const response = cleanEncoded(value)
+      let encodedResponse
       let decoded
       try {
-        decoded = c.decode(CoreSign.messages.Response, z32.decode(response))
+        encodedResponse = z32.decode(response)
+        decoded = SigningRequest.decodeResponse(encodedResponse)
       } catch {
         throw new Error('Invalid signing response')
       }
       const publicKey = z32.encode(decoded.publicKey)
-      await CoreSign.verify(response, request, publicKey)
+      CoreSign.verify(encodedResponse, encodedRequest, decoded.publicKey)
       responses.set(publicKey, { response, decoded })
     }
     return responses
   }
 
-  async _review(room, record, values, commit) {
+  async _treeHash(core, length) {
+    try {
+      return await Hypercore.treeHashFromStorage(core, length)
+    } catch (error) {
+      if (
+        length < 1 ||
+        error.code !== 'INVALID_OPERATION' ||
+        !/Expected tree node \d+ from storage, got \(nil\)/.test(error.message)
+      )
+        throw error
+      await core.get(length - 1, { timeout: this.timeout })
+      return Hypercore.treeHashFromStorage(core, length)
+    }
+  }
+
+  async _review(room, record, values, commit, includeBatch = false) {
     const req = this._decodeRequest(room, record.request)
     const responses = await this._responses(room, record.request, values)
     if (commit && responses.size < req.manifest.quorum)
       throw new Error(
         `Insufficient quorum: ${responses.size} / ${req.manifest.quorum}`
       )
-    const source = await this._source(record.srcKey)
-    if (source.core.fork !== req.fork)
-      throw new Error('The source drive changed forks after this request')
-    if (source.core.length < req.length)
-      throw new Error('The source is shorter than the signed request')
-    const contentManifest = Hyperdrive.getContentManifest(
-      req.manifest,
-      room.target.key
+    const pin = parseSource(record.srcKey)
+    if (pin.key === room.pen.multisigKey)
+      throw new Error('Choose a source drive different from the multisig drive')
+    if (
+      pin.fork !== null &&
+      (pin.fork !== req.fork || pin.length !== req.length)
     )
-    const content = this.store.get({ manifest: contentManifest })
-    await content.ready()
-    let metadataBatch
-    let contentBatch
+      throw new Error('Source version does not match the signing request')
+    const srcKey = normalizeSource(
+      `pear://${req.fork}.${req.length}.${pin.key}`
+    )
+    const source = await this._source(srcKey)
+    const content = room.contentCore
+    if (content.length > req.content.length)
+      throw new Error('The signing request is older than the committed content')
+    if (
+      source.blobs.core.length < req.content.length ||
+      source.blobs.core.fork !== req.fork
+    )
+      await this._update(source.blobs.core, 'length', {
+        length: req.content.length,
+        fork: req.fork
+      })
+    if (source.blobs.core.length < req.content.length)
+      throw new Error('The requested source content version is unavailable')
+    if (source.blobs.core.fork !== req.fork)
+      throw new Error('The source content changed forks after this request')
+    const [metadataHash, contentHash] = await Promise.all([
+      this._treeHash(source.core, req.length),
+      this._treeHash(source.blobs.core, req.content.length)
+    ])
+    if (
+      !b4a.equals(metadataHash, req.treeHash) ||
+      !b4a.equals(contentHash, req.content.treeHash)
+    )
+      throw new Error('The source data does not match the signed request')
+    const files = []
+    const checkout = source.checkout(req.length)
     try {
-      if (content.length > req.content.length)
-        throw new Error(
-          'The signing request is older than the committed content'
-        )
-      await Promise.all([
-        this._download(source.core, room.target.core.length, req.length),
-        this._download(source.blobs.core, content.length, req.content.length)
-      ])
-      metadataBatch = await createUpdateBatch(room.target.core, source.core, {
-        end: req.length
-      })
-      contentBatch = await createUpdateBatch(content, source.blobs.core, {
-        end: req.content.length
-      })
-      if (
-        !b4a.equals(await metadataBatch.treeHash(), req.treeHash) ||
-        !b4a.equals(await contentBatch.treeHash(), req.content.treeHash)
-      )
-        throw new Error('The source data does not match the signed request')
-      const files = []
-      const checkout = source.checkout(req.length)
-      try {
-        for await (const diff of checkout.diff(room.target.core.length)) {
-          const entry = diff.left || diff.right
-          files.push({
-            path: entry.key,
-            action: diff.left ? 'put' : 'delete',
-            size: diff.left?.value?.blob?.byteLength || 0
-          })
-        }
-      } finally {
-        await checkout.close()
+      for await (const diff of checkout.diff(room.target.core.length)) {
+        const entry = diff.left || diff.right
+        files.push({
+          path: entry.key,
+          action: diff.left ? 'put' : 'delete',
+          size: diff.left?.value?.blob?.byteLength || 0
+        })
       }
-      const result = {
-        multisigKey: room.pen.multisigKey,
-        srcKey: record.srcKey,
-        quorum: responses.size,
-        required: req.manifest.quorum,
-        length: req.length,
-        treeHash: z32.encode(req.treeHash),
-        content: {
-          length: req.content.length,
-          treeHash: z32.encode(req.content.treeHash)
-        },
-        files,
-        committed: false
-      }
-      if (commit) {
-        const signatures = req.manifest.signers.map(
-          (signer) =>
-            responses.get(z32.encode(signer.publicKey))?.decoded.signatures
-        )
-        if (content.length < req.content.length)
-          await commitUpdateBatch(
-            content,
-            contentBatch,
-            signatures.map((signature) => signature?.[1]),
-            { length: req.content.length }
-          )
-        await commitUpdateBatch(
-          room.target.core,
-          metadataBatch,
-          signatures.map((signature) => signature?.[0]),
-          { length: req.length }
-        )
-        this.swarm?.join(content.discoveryKey, { client: true, server: true })
-        result.committed = true
-      }
-      return result
     } finally {
-      await metadataBatch?.close()
-      await contentBatch?.close()
-      await content.close()
+      await checkout.close()
+    }
+    const result = {
+      multisigKey: room.pen.multisigKey,
+      srcKey,
+      quorum: responses.size,
+      required: req.manifest.quorum,
+      length: req.length,
+      treeHash: z32.encode(req.treeHash),
+      content: {
+        length: req.content.length,
+        treeHash: z32.encode(req.content.treeHash)
+      },
+      files,
+      committed: false
+    }
+    if (includeBatch) {
+      const [db, blobs] = await Promise.all([
+        this._batchInfo(room.target.core, source.core, req),
+        this._batchInfo(content, source.blobs.core, req.content)
+      ])
+      Object.assign(result, {
+        db,
+        blobs,
+        signers: signerStatus(req, responses)
+      })
+    }
+    if (source.core.fork !== req.fork || source.blobs.core.fork !== req.fork)
+      throw new Error('The source drive changed forks after this request')
+    if (!commit) return result
+    await Promise.all([
+      this._download(source.core, room.target.core.length, req.length),
+      this._download(source.blobs.core, content.length, req.content.length)
+    ])
+    if (source.core.fork !== req.fork || source.blobs.core.fork !== req.fork)
+      throw new Error('The source drive changed forks after this request')
+    const signatures = req.manifest.signers.map(
+      (signer) =>
+        responses.get(z32.encode(signer.publicKey))?.decoded.signatures
+    )
+    await commitDrive(room, source, req, signatures)
+    this.swarm?.join(content.discoveryKey, { client: true, server: true })
+    result.committed = true
+    if (includeBatch) {
+      result.db.destCore = result.db.batch
+      result.blobs.destCore = result.blobs.batch
+    }
+    return result
+  }
+
+  async _batchInfo(destination, source, signed) {
+    const describe = async (core) => {
+      const length = core.length
+      const hash = await this._treeHash(core, length)
+      return { key: id.normalize(core.key), length, treeHash: z32.encode(hash) }
+    }
+    const [destCore, srcCore] = await Promise.all([
+      describe(destination),
+      describe(source)
+    ])
+    if (
+      destCore.length &&
+      destCore.treeHash !==
+        z32.encode(await this._treeHash(source, destCore.length))
+    )
+      throw new Error('The source history does not match the multisig drive')
+    return {
+      destCore,
+      srcCore,
+      batch: {
+        key: destCore.key,
+        length: signed.length,
+        treeHash: z32.encode(signed.treeHash)
+      }
     }
   }
 
-  async _download(core, start, end) {
-    if (start >= end) return
-    const download = core.download({ start, end })
-    let timer
-    try {
-      await Promise.race([
-        download.done(),
-        new Promise((resolve, reject) => {
-          timer = setTimeout(
-            () =>
-              reject(
-                new Error(
-                  'The source data is unavailable. Keep its peer online and try again'
-                )
-              ),
-            this.timeout
-          )
-        })
-      ])
-    } finally {
-      clearTimeout(timer)
-      download.destroy()
-    }
+  _download(core, start, end) {
+    return download(core, start, end, {
+      timeout: this.timeout,
+      onprogress: () => this.emit('progress')
+    })
   }
 
   async _publish(room, payload) {
+    payload = { ...payload, authorName: cleanName(this.data.profile?.name) }
+    if (payload.srcKey !== undefined)
+      payload.srcKey = parseSource(payload.srcKey).key
     const event = protocol.create(
       this.identity,
       room.pen.multisigKey,
@@ -796,8 +1333,19 @@ class PearPen extends EventEmitter {
 
   async _receive(room, event) {
     if (!room.manifest) {
-      this._buffer(room, event)
-      return
+      if (event?.data?.type !== 'request') {
+        this._buffer(room, event)
+        return
+      }
+      if (JSON.stringify(event).length > MAX_MESSAGE)
+        throw new Error('Activity is too large')
+      const req = this._requestManifest(room, cleanEncoded(event.data.request))
+      const signers = req.manifest.signers.map((signer) =>
+        z32.encode(signer.publicKey)
+      )
+      if (!protocol.verify(event, room.pen.multisigKey, signers))
+        throw new Error('Invalid activity signature')
+      await this._installManifest(room, req.manifest)
     }
     if (room.events.some((item) => item.id === event?.id)) return
     const signers = room.manifest.signers.map((signer) =>
@@ -860,6 +1408,7 @@ class PearPen extends EventEmitter {
   }
 
   _channel(peer, room) {
+    if (this.closed || room.closed) return
     const key = `${room.pen.id}:${peer.remotePublicKey.toString('hex')}`
     if (this.channels.has(key)) return
     let channel
@@ -872,13 +1421,14 @@ class PearPen extends EventEmitter {
       protocol: 'pear-pen/activity/v1',
       id: room.topic,
       onopen: () => {
+        if (room.closed) return channel.close()
         room.channels.add(channel)
         sendHistory()
         this._emit()
       },
       onclose: () => {
         room.channels.delete(channel)
-        this.channels.delete(key)
+        if (this.channels.get(key) === channel) this.channels.delete(key)
         this._emit()
       },
       messages: [
@@ -900,7 +1450,7 @@ class PearPen extends EventEmitter {
             }
             this.queue = this.queue
               .then(async () => {
-                if (this.closed || !this.rooms.has(room.pen.id)) return
+                if (this.closed || this.rooms.get(room.pen.id) !== room) return
                 await this._manifest(room)
                 await this._receive(room, event)
               })
@@ -939,11 +1489,75 @@ class PearPen extends EventEmitter {
   }
 }
 
+function manualLength(value) {
+  const length =
+    typeof value === 'string' && /^\d+$/.test(value.trim())
+      ? Number(value)
+      : value
+  if (!Number.isSafeInteger(length) || length < 1)
+    throw new Error('Enter a positive whole number for the source drive length')
+  return length
+}
+
+function requestDetails(req, encoding) {
+  const encode =
+    encoding === 'hex' ? (hash) => hash.toString('hex') : z32.encode
+  return {
+    key: req.id,
+    fork: req.fork,
+    length: req.length,
+    treeHash: encode(req.treeHash),
+    content: {
+      length: req.content.length,
+      treeHash: encode(req.content.treeHash)
+    }
+  }
+}
+
+function signerStatus(req, responses) {
+  return req.manifest.signers.map((signer) => {
+    const publicKey = z32.encode(signer.publicKey)
+    return { publicKey, signed: responses.has(publicKey) }
+  })
+}
+
+function pinnedSource(value, source, length = null) {
+  const pin = parseSource(value)
+  return normalizeSource(
+    `pear://${pin.fork ?? source.core.fork}.${pin.length ?? length ?? source.core.length}.${pin.key}`
+  )
+}
+
 function cleanName(value) {
   if (value === undefined || value === null) return ''
   if (typeof value !== 'string' || value.length > 120)
     throw new Error('Names must be 120 characters or fewer')
   return value.trim()
+}
+
+function suggestUsername() {
+  const adjectives = [
+    'amber',
+    'blue',
+    'calm',
+    'clear',
+    'gentle',
+    'green',
+    'quiet',
+    'silver'
+  ]
+  const nouns = [
+    'birch',
+    'cedar',
+    'fern',
+    'finch',
+    'heron',
+    'lark',
+    'otter',
+    'willow'
+  ]
+  const [a, b, first, second] = crypto.randomBytes(4)
+  return `${adjectives[a % adjectives.length]}-${nouns[b % nouns.length]}-${first}-${second}`
 }
 
 function parseQuorum(value) {

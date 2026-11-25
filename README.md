@@ -15,11 +15,31 @@ Development works with an empty `upgrade` field and disables OTA updates. `npm r
 
 ## Use
 
-Continue with an optional name to create new signing keys automatically. To use existing keys, expand Import keys and paste or select a private key, optionally with its public key. Raw Ed25519 keys and password-encrypted `hypercore-sign` private keys are accepted. A public key alone cannot sign.
+Keep the suggested username or enter your own, then create a password. Pear Pen encrypts the new private signing key with this password and asks for it each time you sign. The username saved with your password stays the same when you edit your display name. Back up the private key and its password. To import an existing key, expand **Import keys** and paste or select the private key, optionally with its public key. Import accepts raw Ed25519 keys and encrypted `hypercore-sign` v3 and v4 backups. Export preserves the imported file format and password. Newly generated backups use the v3-compatible format.
 
-Add a pen using its multisig drive key. Optionally enter a positive whole-number quorum, or leave it on Automatic. The drive’s verified quorum always decides how many signatures are required. An offline entry is retained; if it later differs from the drive, the app shows the entered and actual values while using the drive’s quorum. Automatic mode exchanges authenticated requests, signatures and activity directly with other online signers. Manual and automatic signers share the same activity and quorum. Copy request and Copy response in the activity log open saved output dialogs, including for earlier requests after commit. A signer can also use Copy response for their signature on the current request without signing again. A replacement request closes the previous request as unanswered. Reaching quorum exposes Review; the requester can commit after typing `COMMIT`.
+Add a pen using its multisig drive link, or enter/import its public configuration to derive the link. The verified configuration determines the quorum. Automatic mode exchanges authenticated requests, signatures and activity directly with other online signers. Manual and automatic signers share the same activity and quorum. Copy request and Copy response in the activity log open saved output dialogs, including for earlier requests after commit. A signer can also use Copy response for their signature on the current request without signing again. A replacement request closes the previous request as unanswered. Reaching quorum exposes Review; the requester can commit after typing `COMMIT`.
 
-Manual mode offers Request, Response, Review and Commit, using the same encoded messages as `multisig-cli`. Forms prefill the current request and source key when known. Review and Commit include synced signatures automatically, with pasted responses available as extras. Manual requests and verified responses are also shared with peers, so the two modes interoperate. Tap output to copy it; output remains saved until Close is pressed, including across restarts.
+Open **Pen details** to inspect and copy the full `pear://` link, quorum and peer count, or set a room image. Images are resized and stored locally on each device.
+
+**Configuration** opens a full-screen editor with JSON import, namespace, quorum and signer controls. The JSON view preserves every field, including additional app settings. Import fills a draft; preview and save verify that it produces the pen’s fixed link. A mismatch shows the expected and derived links without changing the pen. An available public manifest can be edited as raw manifest JSON when the original namespace text is unknown.
+
+For a first release whose manifest is not available yet, Pear Pen reads `/pear.json` from the seeded source snapshot when creating a request. Stage that public configuration with the source, or import the original `pear.json` in Pen details. Both paths verify the exact multisig key before initializing its public manifest; an already verified manifest takes precedence. Configuration import does not sign or commit a release.
+
+Source inputs accept versioned links such as `pear://0.3.KEY`. In automatic mode, unversioned inputs resolve to the latest available head; current requests always show the exact signed version. Request creation waits for source discovery and the requested metadata, with a loading indicator; failed attempts can be retried after the source changes without restarting. Sign validates the encoded request and produces a response without downloading release files. Review checks hashes and changed-file metadata, fetching only necessary proofs. Commit downloads and verifies the required release blocks before publishing.
+
+Pear Pen signs and verifies both the requests made for `hypercore-sign` v3 (request format v2) and the newer requests made by Pear’s `hyper-multisig` (format v3). An existing v3 signing key works with either. The response matches the original request format. Pear Pen creates requests in format v2 so peers using the v3 CLI can still sign them.
+
+Manual mode follows the drive workflow in `multisig-cli`.
+
+1. **Create request**. Confirm the destination multisig key, enter the source key, then enter the metadata length to sign. A versioned link fills in its exact length. Copy the encoded request to share it.
+2. **Sign request**. Paste the request or use the one already in the pen. Check the destination, fork, lengths and tree hashes. Confirm your signing public key, then unlock it if encrypted. The resulting response also works with `multisig-cli response`.
+3. **Submit response**. Paste an encoded response from another signer. Pear Pen verifies it against the open request, shares it with the room and shows the quorum. Each signer counts once.
+4. **Review**. Confirm the destination key to inspect the open request, signer status, metadata and content batches, and changed files. You can review before quorum.
+5. **Commit**. Confirm the destination key and type `CONFIRM` to publish once quorum is reached.
+
+To check a signature offline, choose **Verify signature** in manual mode and enter the signed response, its original request and the expected signer’s public key. In automatic mode, choose **Verify** beside a signed response in Activity, even after the request closes. The result identifies the signer and the exact metadata and content they signed. Verification leaves the quorum unchanged.
+
+Review and Commit can also use a pasted request, its source key and collected responses. Output stays available to copy until you close it.
 
 Settings control the display name, system/light/dark appearance and automatic/manual signing mode. Export public key and Export private key open temporary views for copying or sharing a key file. Existing encrypted private keys stay encrypted. Exported keys are never saved in output dialogs; temporary sharing files are removed when the share sheet closes and stale files are cleared at the next launch. Backgrounded mobile worklets are suspended by BareKit; keep the app open while exchanging signatures.
 
@@ -28,6 +48,10 @@ Settings control the display name, system/light/dark appearance and automatic/ma
 `src/App.tsx` owns navigation, theme and update state. `Onboarding`, `PenList` and `PenDetail` render the main screens. `Dialogs` owns signing forms and durable copy outputs; `KeyExport` keeps private exports transient. Shared controls and styling live in `ui.tsx` and `styles.ts`. `client.ts` is the framed worker bridge; signing and networking stay in `core/`.
 
 ## Release and OTA
+
+Native iOS builds use `webcredentials:realpainpoints.com` for Password AutoFill. Include Associated Domains in the signing profile and deploy the matching association file on the support site. New Android binaries ask the system autofill provider to save credentials after successful key creation. Older binaries can still generate encrypted keys, use password fields and sign. [Apple Password AutoFill](https://developer.apple.com/documentation/security/about-the-password-autofill-workflow)
+
+Photo selection and resizing requires a native build containing `expo-image-manipulator`. Older native builds can load the remaining app features and display saved room images; choosing a new image prompts for an app-store update when the module is missing.
 
 Configure your own Pear deployment link in `package.json#upgrade`, or supply `UPGRADE_KEY`. A release without a valid link fails before packaging. `productName` is `PearPen` throughout the deployment directory and updater; the visible app name is Pear Pen.
 
@@ -56,11 +80,20 @@ UPGRADE_KEY=pear://YOUR_DEPLOYMENT_KEY npm run production:android
 UPGRADE_KEY=pear://YOUR_DEPLOYMENT_KEY npm run update
 ```
 
+If an iPhone build selects a wildcard profile and reports that Associated Domains is missing, set `DEVICE_UDID` to the device ID Expo printed. Run this once from the mobile repository to provision `com.pearpen.app`, then retry `npm run production:ios -- --device`.
+
+```sh
+xcodebuild -workspace ios/PearPen.xcworkspace -scheme PearPen -configuration Release \
+  -destination "id=$DEVICE_UDID" -allowProvisioningUpdates build
+```
+
 `npm run update` builds the worklet and both React Native bundles, then produces `dist/` with `pear-build`. CI orchestration, artifact collection and combined desktop/mobile deployment live in `pear-pen-ci-build`.
 
 `package.json#version` is the shared native and OTA version. The `pear-runtime-react-native` Expo plugin installs native bundle selection and reload support. `pear.json#updates.minver` is the minimum native version allowed to receive the OTA payload. Native dependency changes require a new store binary and a corresponding minimum-version increase. JavaScript updates must have a strictly newer version. Configure and seed the actual deployment drive before expecting updates to arrive.
 
-`hypercore-sign` is declared at the app root so npm resolves native dependencies consistently through `file:core`. The `sodium-native` override keeps every consumer on 5.2.1 and prevents BareKit from including the older Sodium 4 Android binary, which lacks 16 KB ELF alignment.
+The signing worker uses `hypercore-sign` v4 to verify signatures and `hyper-multisig` to stage release blocks. Before committing, it checks both trees against the signed request using the pen’s exact manifest. Compatibility tests also run the original v3 signer. The npm override resolves `hyper-multisig`’s verifier to the same public `hypercore-sign@4.1.1` release used by the worker. The `sodium-native` override keeps every consumer on 5.2.1 for Android’s 16 KB ELF alignment.
+
+Search `core/` for `hypercore-sign v3 compatibility` to find the legacy request and key-file code. When retiring the old CLI, keep support for restoring existing encrypted backups until users can migrate them.
 
 `BUILD_NUMBER` sets iOS buildNumber and Android versionCode. Android and iOS application identifiers are `com.pearpen.app`; replace them before your first store release if your organization needs another identity.
 

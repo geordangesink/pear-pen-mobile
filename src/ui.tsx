@@ -1,4 +1,11 @@
-import { ActivityIndicator, Pressable, Text, TextInput, View } from 'react-native'
+import {
+  ActivityIndicator,
+  Pressable,
+  Text,
+  TextInput,
+  View,
+  type TextInputProps
+} from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import { styles } from './styles'
 
@@ -17,7 +24,11 @@ export const light = {
   accentInk: '#293c19',
   overlay: 'rgba(16,25,16,0.28)',
   danger: '#b64a43',
-  success: '#527735'
+  success: '#527735',
+  signingMode: {
+    automatic: { ink: '#385b46', fill: '#e5f1dc', border: '#638452' },
+    manual: { ink: '#785016', fill: '#faefd8', border: '#a47731' }
+  }
 }
 
 export const dark: Palette = {
@@ -31,7 +42,11 @@ export const dark: Palette = {
   accentInk: '#293c19',
   overlay: 'rgba(0,0,0,0.64)',
   danger: '#ed9990',
-  success: '#b7d784'
+  success: '#b7d784',
+  signingMode: {
+    automatic: { ink: '#b8d4a5', fill: '#263625', border: '#81a56e' },
+    manual: { ink: '#f1cc86', fill: '#352c1e', border: '#b48a46' }
+  }
 }
 
 export function Icon({ name, color, size = 22 }: { name: IconName; color: string; size?: number }) {
@@ -86,23 +101,29 @@ export function Field({
   secure = false,
   multiline = false,
   mono = false,
-  numeric = false
+  numeric = false,
+  editable = true,
+  autoComplete,
+  ...inputProps
 }: {
   label: string
   value: string
-  onChange: (value: string) => void
+  onChange?: (value: string) => void
   placeholder?: string
   colors: Palette
   secure?: boolean
   multiline?: boolean
   mono?: boolean
   numeric?: boolean
-}) {
+} & Pick<TextInputProps, 'editable' | 'autoComplete' | 'maxLength'>) {
   return (
     <View style={styles.field}>
       <Text style={[styles.fieldLabel, { color: colors.muted }]}>{label}</Text>
       <TextInput
+        {...inputProps}
         accessibilityLabel={label}
+        autoComplete={autoComplete}
+        importantForAutofill={autoComplete === 'off' ? 'no' : autoComplete ? 'yes' : 'auto'}
         autoCapitalize='none'
         autoCorrect={false}
         keyboardType={numeric ? 'number-pad' : undefined}
@@ -110,6 +131,7 @@ export function Field({
         secureTextEntry={secure}
         multiline={multiline}
         value={value}
+        editable={editable}
         onChangeText={onChange}
         placeholder={placeholder}
         placeholderTextColor={colors.muted}
@@ -129,12 +151,14 @@ export function Segments({
   items,
   value,
   onChange,
-  colors
+  colors,
+  selection
 }: {
   items: string[]
   value: string
   onChange: (value: string) => void
   colors: Palette
+  selection?: Palette['signingMode']['automatic']
 }) {
   return (
     <View style={[styles.segments, { backgroundColor: colors.soft }]}>
@@ -146,10 +170,22 @@ export function Segments({
           onPress={() => onChange(item)}
           style={[
             styles.segment,
-            item === value && { backgroundColor: colors.card, shadowOpacity: 0.06 }
+            item === value && {
+              backgroundColor: selection?.fill ?? colors.card,
+              shadowOpacity: 0.06
+            },
+            selection && {
+              borderWidth: 1,
+              borderColor: item === value ? selection.border : 'transparent'
+            }
           ]}
         >
-          <Text style={[styles.segmentText, { color: item === value ? colors.ink : colors.muted }]}>
+          <Text
+            style={[
+              styles.segmentText,
+              { color: item === value ? (selection?.ink ?? colors.ink) : colors.muted }
+            ]}
+          >
             {item[0].toUpperCase() + item.slice(1)}
           </Text>
         </Pressable>

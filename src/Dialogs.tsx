@@ -1,5 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import {
+  ActivityIndicator,
+  Alert,
   Image,
   KeyboardAvoidingView,
   Linking,
@@ -11,8 +13,12 @@ import {
   View
 } from 'react-native'
 import * as Clipboard from 'expo-clipboard'
-import { call, errorMessage, type SavedDialog, type State } from './client'
+import { call, errorMessage, knownQuorum, type SavedDialog, type State } from './client'
 import KeyExport from './KeyExport'
+import ManualSigning, { type ManualAction } from './ManualSigning'
+import Configuration from './Configuration'
+import PenAvatar from './PenAvatar'
+import { choosePenImage } from './pen-images'
 import { Action, Field, Icon, Segments, type Palette } from './ui'
 import { styles } from './styles'
 import { version } from '../package.json'
@@ -22,33 +28,46 @@ export type Dialog = {
     | 'add'
     | 'settings'
     | 'actions'
-    | 'request'
-    | 'response'
-    | 'review'
-    | 'commit'
+    | 'details'
+    | 'configuration'
+    | ManualAction
     | 'unlock'
     | 'output'
   title?: string
+  name?: string
   text?: string
+  details?: string
   penId?: string
   automatic?: boolean
-  autoSubmit?: boolean
   requestId?: string
   srcKey?: string
 }
 
 const help = 'https://docs.pears.com/pear/how-to/operate-an-app/multisig/set-up-multisig/'
 
+const signingActions = [
+  ['details', 'Pen details', 'information-circle-outline'],
+  ['request', 'Create request', 'add-circle-outline'],
+  ['sign', 'Sign request', 'pencil-outline'],
+  ['response', 'Submit response', 'send-outline'],
+  ['verify', 'Verify signature', 'checkmark-circle-outline'],
+  ['review', 'Review', 'reader-outline'],
+  ['commit', 'Commit', 'checkmark-done-outline']
+] as const
+
 const submitTitles: Partial<Record<Dialog['kind'], string>> = {
   add: 'Add pen',
   request: 'Create request',
-  response: 'Sign request',
   unlock: 'Sign request',
   review: 'Review changes',
   commit: 'Commit changes'
 }
 
-export async function saveOutput(value: unknown, title: string): Promise<SavedDialog> {
+export async function saveOutput(
+  value: unknown,
+  title: string,
+  details?: string
+): Promise<SavedDialog> {
   let text: string
   if (typeof value === 'string') text = value
   else if (
@@ -59,7 +78,7 @@ export async function saveOutput(value: unknown, title: string): Promise<SavedDi
   )
     text = value.output
   else text = JSON.stringify(value, null, 2) ?? ''
-  const dialog: SavedDialog = { kind: 'output', title, text }
+  const dialog: SavedDialog = { kind: 'output', title, text, ...(details && { details }) }
   await call('dialog.save', { dialog })
   return dialog
 }
@@ -70,7 +89,9 @@ export default function DialogView({
   colors,
   onClose,
   onDialog,
-  onToast
+  onToast,
+  onSelectPen,
+  onPenRemoved
 }: {
   dialog: Dialog
   state: State
@@ -78,29 +99,39 @@ export default function DialogView({
   onClose: () => void
   onDialog: (dialog: Dialog) => void
   onToast: (text: string) => void
+  onSelectPen: (penId: string) => void
+  onPenRemoved: (penId: string) => void
 }) {
   const pen = state.pens.find((item) => item.id === dialog.penId)
-  const manualReview = !dialog.automatic && ['review', 'commit'].includes(dialog.kind)
-  const manualRequest = !dialog.automatic && ['response', 'review', 'commit'].includes(dialog.kind)
-  const [name, setName] = useState(dialog.kind === 'settings' ? state.profile!.name : '')
+  const quorum = pen ? knownQuorum(pen) : 0
+  const kind = dialog.kind
+  const manual =
+    !dialog.automatic &&
+    (kind === 'request' ||
+      kind === 'sign' ||
+      kind === 'response' ||
+      kind === 'verify' ||
+      kind === 'review' ||
+      kind === 'commit')
+  const [name, setName] = useState(
+    dialog.kind === 'settings' ? state.profile!.name : dialog.name || ''
+  )
   const [editing, setEditing] = useState(false)
   const [exportKind, setExportKind] = useState<'public' | 'private' | null>(null)
-  const [key, setKey] = useState(manualReview ? pen?.request?.srcKey || '' : '')
-  const [request, setRequest] = useState(manualRequest ? pen?.request?.request || '' : '')
-  const [responses, setResponses] = useState('')
-  const [quorum, setQuorum] = useState('')
+  const [key, setKey] = useState('')
   const [password, setPassword] = useState('')
   const [confirmation, setConfirmation] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
-  const kind = dialog.kind
-  const needsKey = kind === 'add' || kind === 'request' || manualReview
+  const needsPassword = kind === 'unlock' && state.profile?.encrypted
+  const username = state.profile?.username || state.profile?.name
+  const needsKey = kind === 'add' || kind === 'request'
   const submitDisabled =
+    (needsPassword && !password) ||
     (needsKey && !key.trim()) ||
-    (manualRequest && !request.trim()) ||
     (kind === 'commit' && confirmation !== 'COMMIT')
-  const submitTitle = submitTitles[kind]
+  const submitTitle = !manual && submitTitles[kind]
   const title =
     (exportKind ? `Export ${exportKind} key` : '') ||
     dialog.title ||
@@ -108,36 +139,29 @@ export default function DialogView({
       add: 'Add a pen',
       settings: 'Settings',
       actions: pen?.name || 'Signing actions',
+      details: 'Pen details',
+      configuration: 'Configuration',
       request: 'New request',
-      response: 'Sign request',
+      sign: 'Sign request',
+      response: 'Submit response',
+      verify: 'Verify signature',
       review: 'Review request',
       commit: 'Commit release',
       unlock: 'Sign request',
       output: 'Output'
     }[kind]
 
-  async function output(result: unknown, title: string) {
-    onDialog(await saveOutput(result, title))
+  async function output(result: unknown, title: string, details?: string) {
+    onDialog(await saveOutput(result, title, details))
   }
   async function submit() {
     setBusy(true)
     setError('')
     try {
       if (kind === 'add') {
-        const enteredQuorum = quorum.trim()
-        const requiredSignatures = Number(enteredQuorum)
-        if (
-          enteredQuorum &&
-          (!/^\d+$/.test(enteredQuorum) ||
-            !Number.isSafeInteger(requiredSignatures) ||
-            requiredSignatures < 1)
-        ) {
-          throw new Error('Enter a positive whole number, or leave quorum blank for Automatic.')
-        }
         await call('pen.add', {
           name: name.trim(),
-          multisigKey: key.trim(),
-          ...(enteredQuorum && { quorum: requiredSignatures })
+          multisigKey: key.trim()
         })
         onClose()
       } else if (kind === 'settings') {
@@ -150,38 +174,16 @@ export default function DialogView({
         onClose()
         onToast('Signature sent')
       } else if (kind === 'request') {
-        const result = await call(dialog.automatic ? 'request.create' : 'manual.request', {
-          penId: pen!.id,
-          srcKey: key.trim()
-        })
-        if (dialog.automatic) {
-          onClose()
-          onToast('Request shared')
-        } else await output(result, 'Signing request')
-      } else if (kind === 'response') {
-        const result = await call('manual.response', {
-          penId: pen!.id,
-          request: request.trim(),
-          password
-        })
-        setPassword('')
-        await output(result, 'Signature response')
+        await call('request.create', { penId: pen!.id, srcKey: key.trim() })
+        onClose()
+        onToast('Request shared')
       } else if (kind === 'review' || kind === 'commit') {
-        const params = dialog.automatic
-          ? { penId: pen!.id, confirmation, requestId: dialog.requestId }
-          : {
-              penId: pen!.id,
-              request: request.trim(),
-              responses: responses
-                .trim()
-                .split(/[\s,]+/)
-                .filter(Boolean),
-              srcKey: key.trim(),
-              confirmation
-            }
-        const result = await call(`${dialog.automatic ? 'request' : 'manual'}.${kind}`, params)
-        if (kind === 'review' || !dialog.automatic)
-          await output(result, kind === 'review' ? 'Review' : 'Commit complete')
+        const result = await call(`request.${kind}`, {
+          penId: pen!.id,
+          confirmation,
+          requestId: dialog.requestId
+        })
+        if (kind === 'review') await output(result, 'Review')
         else {
           onClose()
           onToast('Request committed')
@@ -193,9 +195,6 @@ export default function DialogView({
       setBusy(false)
     }
   }
-  useEffect(() => {
-    if (kind === 'unlock' && dialog.autoSubmit) void submit()
-  }, [])
 
   async function setting(change: Record<string, string>) {
     try {
@@ -205,10 +204,86 @@ export default function DialogView({
     }
   }
 
+  async function copy(text: string, message = 'Copied to clipboard') {
+    try {
+      await Clipboard.setStringAsync(text)
+      setCopied(true)
+      setError('')
+      onToast(message)
+    } catch {
+      setError('Could not copy. Try again.')
+    }
+  }
+
+  async function updateImage(action: 'change' | 'remove') {
+    if (!pen || busy) return
+    setBusy(true)
+    setError('')
+    try {
+      let image: string | null = null
+      if (action === 'change') {
+        image = await choosePenImage()
+        if (!image) return
+      }
+      await call('pen.image', { penId: pen.id, image })
+      onToast(action === 'remove' ? 'Pen image removed' : 'Pen image updated')
+    } catch (problem) {
+      setError(errorMessage(problem))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function confirmRemoval() {
+    if (!pen || busy) return
+    Alert.alert(
+      'Remove pen from this device?',
+      `${pen.name}\n\nYou can add it again with its multisig link.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Remove',
+          style: 'destructive',
+          onPress: async () => {
+            setBusy(true)
+            setError('')
+            try {
+              await call('pen.remove', { penId: pen.id })
+              onPenRemoved(pen.id)
+            } catch (problem) {
+              setError(errorMessage(problem))
+            } finally {
+              setBusy(false)
+            }
+          }
+        }
+      ],
+      { cancelable: true }
+    )
+  }
+
   function closeSheet() {
     if (busy) return
     if (exportKind) setExportKind(null)
     else onClose()
+  }
+
+  if (kind === 'configuration') {
+    return (
+      <Configuration
+        pen={pen}
+        initialName={dialog.name}
+        colors={colors}
+        onClose={(name) =>
+          onDialog(pen ? { kind: 'details', penId: pen.id } : { kind: 'add', name })
+        }
+        onSaved={(penId) => {
+          if (!pen) onSelectPen(penId)
+          onToast(pen ? 'Configuration saved' : 'Pen added')
+          onDialog({ kind: 'details', penId })
+        }}
+      />
+    )
   }
 
   return (
@@ -238,20 +313,22 @@ export default function DialogView({
           </View>
           <ScrollView
             keyboardShouldPersistTaps='handled'
+            keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
             contentContainerStyle={styles.sheetContent}
           >
             {kind === 'add' && (
               <>
+                <Segments
+                  items={['link', 'configuration']}
+                  value='link'
+                  onChange={(mode) => {
+                    if (!busy && mode === 'configuration') onDialog({ kind: 'configuration', name })
+                  }}
+                  colors={colors}
+                />
                 <Text style={[styles.body, { color: colors.muted }]}>
                   Add an existing multisig drive.
                 </Text>
-                <Field
-                  label='PEN NAME · OPTIONAL'
-                  value={name}
-                  onChange={setName}
-                  placeholder='e.g. Our next release'
-                  colors={colors}
-                />
                 <Field
                   label='MULTISIG DRIVE KEY'
                   value={key}
@@ -261,22 +338,23 @@ export default function DialogView({
                   mono
                   multiline
                 />
+                <Field
+                  label='PEN NAME · OPTIONAL'
+                  value={name}
+                  onChange={setName}
+                  placeholder='Defaults to the drive link'
+                  colors={colors}
+                />
                 <Pressable onPress={() => void Linking.openURL(help)} style={styles.helpLink}>
                   <Icon name='help-circle-outline' color={colors.success} size={17} />
                   <Text style={[styles.small, { color: colors.success }]}>
                     Where do I find this key? ↗
                   </Text>
                 </Pressable>
-                <Field
-                  label='Quorum'
-                  value={quorum}
-                  onChange={setQuorum}
-                  placeholder='Automatic'
-                  colors={colors}
-                  numeric
-                />
-                <Text style={[styles.small, { color: colors.muted, marginTop: 7 }]}>
-                  Required signatures. Verified from the drive.
+                <Text style={[styles.settingsHint, { color: colors.muted }]}>
+                  You can sign or review an existing request without adding a configuration. To
+                  create a request, Pear Pen can use /pear.json at the root of the source drive or
+                  the configuration in Pen details.
                 </Text>
               </>
             )}
@@ -325,6 +403,7 @@ export default function DialogView({
                   value={state.settings.mode}
                   onChange={(mode) => void setting({ mode })}
                   colors={colors}
+                  selection={colors.signingMode[state.settings.mode]}
                 />
                 <Text style={[styles.settingsHint, { color: colors.muted }]}>
                   {state.settings.mode === 'automatic'
@@ -378,33 +457,105 @@ export default function DialogView({
             {exportKind && (
               <KeyExport key={exportKind} kind={exportKind} colors={colors} onToast={onToast} />
             )}
+            {kind === 'details' && pen && (
+              <>
+                <View style={[styles.row, { gap: 16, marginTop: 8 }]}>
+                  <PenAvatar image={pen.image} colors={colors} size={72} />
+                  <View style={styles.grow}>
+                    <Action
+                      title={pen.image ? 'Change image' : 'Choose image'}
+                      onPress={() => void updateImage('change')}
+                      colors={colors}
+                      busy={busy}
+                      secondary
+                    />
+                    {pen.image && (
+                      <Pressable
+                        accessibilityRole='button'
+                        disabled={busy}
+                        onPress={() => void updateImage('remove')}
+                        style={{ alignItems: 'center', paddingVertical: 10 }}
+                      >
+                        <Text style={[styles.small, { color: colors.muted }]}>Remove image</Text>
+                      </Pressable>
+                    )}
+                  </View>
+                </View>
+                {pen.name !== `pear://${pen.multisigKey}` && (
+                  <>
+                    <Text style={[styles.sectionLabel, { color: colors.muted }]}>NAME</Text>
+                    <Text style={[styles.settingsName, { color: colors.ink }]}>{pen.name}</Text>
+                  </>
+                )}
+                <Text style={[styles.sectionLabel, { color: colors.muted }]}>
+                  MULTISIG DRIVE LINK
+                </Text>
+                <Text
+                  selectable
+                  style={[styles.reviewKey, { color: colors.ink, backgroundColor: colors.soft }]}
+                >
+                  pear://{pen.multisigKey}
+                </Text>
+                <Action
+                  title={copied ? 'Link copied' : 'Copy link'}
+                  onPress={() => void copy(`pear://${pen.multisigKey}`, 'Pen link copied')}
+                  colors={colors}
+                  secondary
+                />
+                {quorum > 0 && (
+                  <View style={[styles.manualAction, { borderBottomColor: colors.line }]}>
+                    <Text style={[styles.manualText, { color: colors.ink }]}>Quorum</Text>
+                    <Text style={[styles.body, { color: colors.muted }]}>{quorum}</Text>
+                  </View>
+                )}
+                <View style={[styles.manualAction, { borderBottomColor: colors.line }]}>
+                  <Text style={[styles.manualText, { color: colors.ink }]}>Connected peers</Text>
+                  <Text style={[styles.body, { color: colors.muted }]}>{pen.peers}</Text>
+                </View>
+                {pen.quorumMismatch && (
+                  <Text style={[styles.settingsHint, { color: colors.muted }]}>
+                    Drive quorum is {pen.quorum} (entered {pen.configuredQuorum}).
+                  </Text>
+                )}
+                <Text style={[styles.settingsHint, { color: colors.muted }]}>
+                  Read from the source automatically, or import its pear.json.
+                </Text>
+                <Action
+                  title='Configuration'
+                  onPress={() => onDialog({ kind: 'configuration', penId: pen.id })}
+                  colors={colors}
+                  busy={busy}
+                  secondary
+                />
+                <Pressable
+                  accessibilityRole='button'
+                  disabled={busy}
+                  onPress={confirmRemoval}
+                  style={[styles.manualAction, { borderBottomColor: colors.line }]}
+                >
+                  <Icon name='trash-outline' color={colors.danger} size={20} />
+                  <Text style={[styles.manualText, { color: colors.danger }]}>
+                    Remove pen from this device
+                  </Text>
+                </Pressable>
+              </>
+            )}
             {kind === 'actions' && (
               <>
                 <Text style={[styles.body, styles.actionsIntro, { color: colors.muted }]}>
                   Choose an action.
                 </Text>
-                {(['request', 'response', 'review', 'commit'] as const).map((action) => (
+                {signingActions.map(([action, label, icon]) => (
                   <Pressable
                     key={action}
                     accessibilityRole='button'
-                    onPress={() => onDialog({ kind: action, penId: pen!.id })}
+                    onPress={() =>
+                      onDialog({ kind: action, penId: pen!.id, requestId: pen!.request?.id })
+                    }
                     style={[styles.manualAction, { borderBottomColor: colors.line }]}
                   >
-                    <Icon
-                      name={
-                        action === 'request'
-                          ? 'add-circle-outline'
-                          : action === 'response'
-                            ? 'pencil-outline'
-                            : action === 'review'
-                              ? 'reader-outline'
-                              : 'checkmark-done-outline'
-                      }
-                      color={colors.success}
-                    />
-                    <Text style={[styles.manualText, { color: colors.ink }]}>
-                      {action[0].toUpperCase() + action.slice(1)}
-                    </Text>
+                    <Icon name={icon} color={colors.success} />
+                    <Text style={[styles.manualText, { color: colors.ink }]}>{label}</Text>
                     <Icon name='chevron-forward' color={colors.muted} size={17} />
                   </Pressable>
                 ))}
@@ -413,78 +564,49 @@ export default function DialogView({
                 </View>
               </>
             )}
-            {kind === 'request' && (
-              <>
-                <Text style={[styles.body, { color: colors.muted }]}>
-                  {dialog.automatic && pen?.request
-                    ? 'Opening a new request closes the current one as unanswered.'
-                    : 'Enter the source drive key.'}
-                </Text>
-                <Field
-                  label='SOURCE KEY'
-                  value={key}
-                  onChange={setKey}
-                  placeholder='Paste the full source key'
-                  colors={colors}
-                  mono
-                  multiline
-                />
-              </>
+            {manual && pen && state.profile && (
+              <ManualSigning
+                method={kind}
+                pen={pen}
+                profile={state.profile}
+                requestId={dialog.requestId}
+                colors={colors}
+                busy={busy}
+                setBusy={setBusy}
+                onBack={() => onDialog({ kind: 'actions', penId: pen.id })}
+                onOutput={output}
+              />
             )}
-            {kind === 'response' && (
-              <>
-                <Field
-                  label='SIGNING REQUEST'
-                  value={request}
-                  onChange={setRequest}
-                  placeholder='Paste the request from the requester'
-                  colors={colors}
-                  mono
-                  multiline
-                />
-                {state.profile?.encrypted && (
+            {!manual &&
+              kind === 'request' &&
+              (busy ? (
+                <View style={styles.center}>
+                  <ActivityIndicator color={colors.success} size='large' />
+                  <Text style={[styles.body, { color: colors.muted }]}>
+                    Connecting and loading source…
+                  </Text>
+                  <Text selectable style={[styles.sourceKey, { color: colors.ink }]}>
+                    {key.trim()}
+                  </Text>
+                </View>
+              ) : (
+                <>
+                  <Text style={[styles.body, { color: colors.muted }]}>
+                    {pen?.request
+                      ? 'Opening a new request closes the current one as unanswered.'
+                      : 'Enter the source drive key or pear:// link.'}
+                  </Text>
                   <Field
-                    label='KEY PASSWORD'
-                    value={password}
-                    onChange={setPassword}
+                    label='SOURCE KEY'
+                    value={key}
+                    onChange={setKey}
+                    placeholder='Paste a source key or pear:// link'
                     colors={colors}
-                    placeholder='Unlock your signing key'
-                    secure
+                    mono
+                    multiline
                   />
-                )}
-              </>
-            )}
-            {(kind === 'review' || kind === 'commit') && !dialog.automatic && (
-              <>
-                <Field
-                  label='SOURCE KEY'
-                  value={key}
-                  onChange={setKey}
-                  placeholder='The source key used in the request'
-                  colors={colors}
-                  mono
-                  multiline
-                />
-                <Field
-                  label='SIGNING REQUEST'
-                  value={request}
-                  onChange={setRequest}
-                  placeholder='Paste the original request'
-                  colors={colors}
-                  mono
-                  multiline
-                />
-                <Field
-                  label='ADDITIONAL RESPONSES · OPTIONAL'
-                  value={responses}
-                  onChange={setResponses}
-                  placeholder='Paste extra responses, one per line'
-                  colors={colors}
-                  mono
-                  multiline
-                />
-              </>
-            )}
+                </>
+              ))}
             {kind === 'review' && dialog.automatic && (
               <>
                 <Text style={[styles.body, { color: colors.muted }]}>
@@ -498,11 +620,17 @@ export default function DialogView({
                 </Text>
               </>
             )}
-            {kind === 'commit' && (
+            {kind === 'commit' && dialog.automatic && (
               <>
                 <Text style={[styles.body, { color: colors.muted }]}>
                   This publishes the signed changes to the multisig drive. Review them first, then
                   type COMMIT to continue.
+                </Text>
+                <Text
+                  selectable
+                  style={[styles.reviewKey, { color: colors.ink, backgroundColor: colors.soft }]}
+                >
+                  {dialog.srcKey}
                 </Text>
                 <Field
                   label='TYPE COMMIT TO CONFIRM'
@@ -518,7 +646,7 @@ export default function DialogView({
                 <Text style={[styles.body, { color: colors.muted }]}>
                   {busy
                     ? 'Verifying the request and sending your signature…'
-                    : 'Unlock your key to sign the current request.'}
+                    : 'Your signature approves this exact source snapshot.'}
                 </Text>
                 <Text
                   selectable
@@ -526,16 +654,28 @@ export default function DialogView({
                 >
                   {dialog.srcKey}
                 </Text>
-                {state.profile?.encrypted && (
+              </>
+            )}
+            {needsPassword && (
+              <>
+                {username && (
                   <Field
-                    label='KEY PASSWORD'
-                    value={password}
-                    onChange={setPassword}
+                    label='USERNAME'
+                    value={username}
                     colors={colors}
-                    placeholder='Your key password'
-                    secure
+                    autoComplete='username'
+                    editable={false}
                   />
                 )}
+                <Field
+                  label='PASSWORD'
+                  value={password}
+                  onChange={setPassword}
+                  colors={colors}
+                  placeholder='Enter your key password'
+                  autoComplete='current-password'
+                  secure
+                />
               </>
             )}
             {kind === 'output' && (
@@ -543,18 +683,18 @@ export default function DialogView({
                 <Text style={[styles.body, { color: colors.muted }]}>
                   Tap to copy. This stays here until you close it.
                 </Text>
+                {!!dialog.details && (
+                  <Text
+                    selectable
+                    style={[styles.reviewKey, { color: colors.ink, backgroundColor: colors.soft }]}
+                  >
+                    {dialog.details}
+                  </Text>
+                )}
                 <Pressable
                   accessibilityRole='button'
                   accessibilityLabel='Copy output'
-                  onPress={async () => {
-                    try {
-                      await Clipboard.setStringAsync(dialog.text || '')
-                      setCopied(true)
-                      onToast('Copied to clipboard')
-                    } catch {
-                      setError('Could not copy. Try again.')
-                    }
-                  }}
+                  onPress={() => void copy(dialog.text || '')}
                   style={[
                     styles.output,
                     { backgroundColor: colors.soft, borderColor: colors.line }
@@ -583,7 +723,7 @@ export default function DialogView({
                 {error}
               </Text>
             )}
-            {submitTitle && (
+            {submitTitle && !(kind === 'request' && busy) && (
               <Action
                 title={submitTitle}
                 onPress={() => void submit()}

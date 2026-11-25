@@ -1,7 +1,8 @@
 node_modules/
 .expo/
 ios/
-android/
+/android/
+modules/*/android/build/
 modules/pear-runtime-reload/
 src/worker.bundle.js
 out/

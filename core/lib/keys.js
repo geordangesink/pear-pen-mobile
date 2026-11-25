@@ -1,9 +1,11 @@
 const b4a = require('b4a')
 const c = require('compact-encoding')
 const crypto = require('hypercore-crypto')
+const { EncryptedKey } = require('hypercore-sign-v4/lib/encoding')
 const sodium = require('sodium-native')
 const z32 = require('z32')
 
+// hypercore-sign v3 compatibility: new encrypted backups use the unversioned key envelope.
 const encryptedKey = {
   preencode(state, key) {
     c.uint64.preencode(state, key.ops)
@@ -40,6 +42,16 @@ function decode(value) {
   }
 }
 
+function validateSecret(secret) {
+  const pair = crypto.keyPair(secret.subarray(0, 32))
+  try {
+    if (!b4a.equals(pair.secretKey, secret))
+      throw new Error('Invalid Ed25519 private key')
+  } finally {
+    pair.secretKey.fill(0)
+  }
+}
+
 function unlock(value, password) {
   const data = decode(value)
   if (data.length === 32) {
@@ -48,12 +60,11 @@ function unlock(value, password) {
     return pair.secretKey
   }
   if (data.length === 64) {
-    const derived = crypto.keyPair(data.subarray(0, 32))
-    const valid = b4a.equals(derived.secretKey, data)
-    derived.secretKey.fill(0)
-    if (!valid) {
+    try {
+      validateSecret(data)
+    } catch (error) {
       data.fill(0)
-      throw new Error('Invalid Ed25519 private key')
+      throw error
     }
     return data
   }
@@ -64,36 +75,41 @@ function unlock(value, password) {
     error.code = 'PASSWORD_REQUIRED'
     throw error
   }
+  // hypercore-sign v3 compatibility: 153-byte backups omit the version and public key.
+  const legacy = data.length === 153
+  if (!legacy && data.length !== 186)
+    throw new Error('Invalid hypercore-sign private key')
   let key
   try {
-    key = c.decode(encryptedKey, data)
+    key = c.decode(legacy ? encryptedKey : EncryptedKey, data)
   } catch {
     throw new Error('Invalid hypercore-sign private key')
   }
+  if (!legacy && key.version !== 1)
+    throw new Error('Unsupported private key version')
+  const { ops, mem } = key.params || key
   if (
     key.payload.length !== 104 ||
-    !Number.isSafeInteger(key.ops) ||
-    !Number.isSafeInteger(key.mem) ||
-    key.ops < 32768 ||
-    key.ops > 2147483648 ||
-    key.mem < 16777216 ||
-    key.mem > 1073741824
+    !Number.isSafeInteger(ops) ||
+    !Number.isSafeInteger(mem) ||
+    ops < 32768 ||
+    ops > 2147483648 ||
+    mem < 16777216 ||
+    mem > 1073741824
   )
     throw new Error('Unsupported private key encryption parameters')
   const out = b4a.alloc(104)
   const pwd = b4a.from(password)
   try {
-    sodium.crypto_pwhash_scryptsalsa208sha256(
-      out,
-      pwd,
-      key.salt,
-      key.ops,
-      key.mem
-    )
+    sodium.crypto_pwhash_scryptsalsa208sha256(out, pwd, key.salt, ops, mem)
     for (let i = 0; i < out.length; i++) out[i] ^= key.payload[i]
     if (!b4a.equals(crypto.hash(out.subarray(0, 72)), out.subarray(72)))
       throw new Error('Incorrect private key password')
-    return b4a.from(out.subarray(8, 72))
+    const secret = out.subarray(8, 72)
+    validateSecret(secret)
+    if (key.publicKey && !b4a.equals(key.publicKey, secret.subarray(32)))
+      throw new Error('The public and private keys do not match')
+    return b4a.from(secret)
   } finally {
     out.fill(0)
     pwd.fill(0)
@@ -109,14 +125,11 @@ function importIdentity({ publicKey, secretKey, password } = {}) {
   let pub = publicText ? decode(publicText) : null
   if (pub && pub.length !== 32)
     throw new Error('Public key must contain 32 bytes')
-  let secret
-  if (secretText) {
-    secret = unlock(secretText, password)
-  } else {
-    secret = crypto.keyPair().secretKey
-    secretText = z32.encode(secret)
-  }
+  const secret = secretText
+    ? unlock(secretText, password)
+    : crypto.keyPair().secretKey
   try {
+    if (!secretText) secretText = encrypt(secret, password)
     if (!pub) pub = b4a.from(secret.subarray(32))
     if (
       !crypto.verify(
@@ -174,6 +187,7 @@ function encrypt(secret, password) {
     crypto.hash(payload.subarray(0, 72)).copy(payload, 72)
     sodium.crypto_pwhash_scryptsalsa208sha256(mask, pwd, salt, ops, mem)
     for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i]
+    // hypercore-sign v3 compatibility: retain the legacy backup for newly encrypted identities.
     return z32.encode(c.encode(encryptedKey, { ops, mem, salt, payload }))
   } finally {
     payload.fill(0)

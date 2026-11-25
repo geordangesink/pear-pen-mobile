@@ -56,6 +56,11 @@ function verify(event, pen, signers) {
       return false
     if (!['request', 'response', 'review', 'commit'].includes(data.type))
       return false
+    if (
+      data.authorName !== undefined &&
+      (typeof data.authorName !== 'string' || data.authorName.length > 120)
+    )
+      return false
     if (typeof data.nonce !== 'string' || !/^[a-f\d]{32}$/.test(data.nonce))
       return false
     const hash = digest(data)
@@ -93,6 +98,38 @@ function normalizeKey(value) {
   }
 }
 
+function parseSource(value) {
+  if (typeof value !== 'string')
+    throw new Error('Enter a source drive key or link')
+  try {
+    const input = value.trim()
+    const linked = input.startsWith('pear://')
+    const source = (linked ? input.slice(7) : input).replace(/\/$/, '')
+    if (/[\/\\?#]/.test(source)) throw new Error()
+    const parts = source.split('.')
+    if (parts.length === 1) {
+      const key = id.normalize(source)
+      return { key, fork: null, length: null, link: key }
+    }
+    if (!linked || parts.length !== 3) throw new Error()
+    const [forkValue, lengthValue, keyValue] = parts
+    if (!/^\d+$/.test(forkValue) || !/^\d+$/.test(lengthValue))
+      throw new Error()
+    const fork = Number(forkValue)
+    const length = Number(lengthValue)
+    if (!Number.isSafeInteger(fork) || !Number.isSafeInteger(length))
+      throw new Error()
+    const key = id.normalize(keyValue)
+    return { key, fork, length, link: `pear://${fork}.${length}.${key}` }
+  } catch {
+    throw new Error('Enter a valid source key or pear://fork.length.key link')
+  }
+}
+
+function normalizeSource(value) {
+  return parseSource(value).link
+}
+
 function cleanEncoded(value) {
   if (
     typeof value !== 'string' ||
@@ -114,5 +151,7 @@ module.exports = {
   MAX_MESSAGE,
   cleanEncoded,
   normalizeKey,
+  parseSource,
+  normalizeSource,
   requestHash
 }

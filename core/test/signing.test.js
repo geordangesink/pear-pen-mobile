@@ -10,26 +10,36 @@ const c = require('compact-encoding')
 const z32 = require('z32')
 const id = require('hypercore-id-encoding')
 const Hyperdrive = require('hyperdrive')
+const Hypercore = require('hypercore')
 const { inflate } = require('hypercore/lib/multisig')
+const { signCore } = require('hyper-multisig/lib/sign')
 const SecretStream = require('@hyperswarm/secret-stream')
+// hypercore-sign v3 compatibility: check legacy requests and responses with the original verifier.
 const CoreSign = require('hypercore-sign')
 const SigningRequest = require('hypercore-signing-request')
 const PearPen = require('..')
 const keys = require('../lib/keys')
 const protocol = require('../lib/protocol')
-const { createUpdateBatch, commitUpdateBatch } = require('../lib/batches')
 
-async function createDrive(store, publicKeys, namespace) {
-  const manifest = {
+function manifestFor(
+  publicKeys,
+  namespace,
+  quorum = Math.floor(publicKeys.length / 2) + 1
+) {
+  return {
     version: 1,
     hash: 'blake2b',
-    quorum: Math.floor(publicKeys.length / 2) + 1,
+    quorum,
     signers: publicKeys.map((publicKey) => ({
       signature: 'ed25519',
       publicKey: id.decode(publicKey),
       namespace: crypto.hash(Buffer.from(namespace))
     }))
   }
+}
+
+async function createDrive(store, publicKeys, namespace) {
+  const manifest = manifestFor(publicKeys, namespace)
   const core = store.get({ manifest })
   await core.ready()
   const blobsCore = store.get({
@@ -74,6 +84,7 @@ async function fixture(t, count = 3, options = {}) {
   return { engine, pairs, target, srcKey, penId, dir }
 }
 
+// hypercore-sign v3 compatibility: build independent legacy CLI responses for the workflow tests.
 function sign(request, pair) {
   const req = SigningRequest.decode(z32.decode(request))
   return z32.encode(
@@ -282,6 +293,307 @@ test('manual requests produce interoperable signatures and commit real drive dat
   )
 })
 
+test('manual verification checks both signatures offline on a non-signer device without changing the pen', async (t) => {
+  const { engine, pairs, penId, srcKey } = await fixture(t)
+  const { output: request } = await engine.command('manual.request', {
+    penId,
+    srcKey
+  })
+  const response = sign(request, pairs[1])
+  const publicKey = z32.encode(pairs[1].publicKey)
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-verifier-'))
+  const observer = new PearPen({ dir, network: false })
+  t.after(async () => {
+    await observer.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await observer.command('profile.import', { password: 'observer password' })
+  const otherPen = z32.encode(crypto.randomBytes(32))
+  for (const multisigKey of [penId, otherPen])
+    await observer.command('pen.add', { multisigKey })
+  const before = observer.snapshot()
+  const state = fs.readFileSync(path.join(dir, 'state.json'))
+  observer._source = observer._update = () =>
+    assert.fail('Unexpected drive access')
+  const verify = (changes) =>
+    observer.command('manual.verify', {
+      penId,
+      request,
+      response,
+      publicKey,
+      ...changes
+    })
+
+  const req = SigningRequest.decode(z32.decode(request))
+  const result = await verify({ publicKey: pairs[1].publicKey.toString('hex') })
+  assert.equal(result.verified, true)
+  assert.equal(result.signer, publicKey)
+  assert.ok(typeof result.output === 'string' && result.output.trim())
+  assert.deepEqual(result.details, {
+    key: penId,
+    fork: req.fork,
+    length: req.length,
+    treeHash: req.treeHash.toString('hex'),
+    content: {
+      length: req.content.length,
+      treeHash: req.content.treeHash.toString('hex')
+    }
+  })
+  for (const changes of [
+    { penId: otherPen },
+    { publicKey: z32.encode(pairs[0].publicKey) },
+    { publicKey: '' },
+    { publicKey: 'invalid' },
+    { request: '!' },
+    { response: z32.encode(z32.decode(response).subarray(0, 64)) }
+  ]) {
+    await assert.rejects(verify(changes))
+  }
+  for (const index of [0, 1]) {
+    const decoded = c.decode(CoreSign.messages.Response, z32.decode(response))
+    decoded.signatures[index][0] ^= 1
+    const forged = z32.encode(c.encode(CoreSign.messages.Response, decoded))
+    await assert.rejects(verify({ response: forged }))
+  }
+  assert.deepEqual(observer.snapshot(), before)
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'state.json')), state)
+  assert.equal(observer.rooms.get(penId).target.core.manifest, null)
+  assert.equal(observer.drives.has(srcKey), false)
+})
+
+test('CLI manual workflow signs, accepts an external response, reviews and confirms a pinned drive', async (t) => {
+  const { engine, pairs, penId, srcKey, target } = await fixture(t)
+  const source = await engine._source(srcKey)
+  const length = source.core.length
+  await source.put('/later.txt', Buffer.from('later'))
+  const destination = { penId, multisigKey: `pear://${penId}` }
+  const { output: request, details } = await engine.command('manual.request', {
+    ...destination,
+    srcKey,
+    length
+  })
+  const req = SigningRequest.decode(z32.decode(request))
+  assert.equal(req.id, penId)
+  assert.equal(req.length, length)
+  assert.deepEqual(details, {
+    key: penId,
+    fork: req.fork,
+    length,
+    treeHash: z32.encode(req.treeHash),
+    content: {
+      length: req.content.length,
+      treeHash: z32.encode(req.content.treeHash)
+    }
+  })
+  const current = engine.snapshot().pens[0].request
+  assert.equal(current.srcKey, `pear://${req.fork}.${length}.${srcKey}`)
+  const selection = { ...destination, requestId: current.id }
+  const preview = await engine.command('manual.inspect', { penId, request })
+  assert.deepEqual(preview, {
+    key: penId,
+    fork: req.fork,
+    length,
+    treeHash: req.treeHash.toString('hex'),
+    content: {
+      length: req.content.length,
+      treeHash: req.content.treeHash.toString('hex')
+    },
+    signer: z32.encode(pairs[0].publicKey)
+  })
+  const unsigned = await engine.command('manual.review', selection)
+  assert.equal(unsigned.quorum, 0)
+  assert.equal(unsigned.committed, false)
+  assert.equal(target.core.length, 0)
+  for (const [batch, from, to, signed] of [
+    [unsigned.db, source.core, target.core, req],
+    [unsigned.blobs, source.blobs.core, target.blobsCore, req.content]
+  ]) {
+    assert.deepEqual(batch.srcCore, {
+      key: from.id,
+      length: from.length,
+      treeHash: z32.encode(await from.treeHash())
+    })
+    assert.deepEqual(batch.destCore, {
+      key: to.id,
+      length: to.length,
+      treeHash: z32.encode(await to.treeHash())
+    })
+    assert.deepEqual(batch.batch, {
+      key: to.id,
+      length: signed.length,
+      treeHash: z32.encode(signed.treeHash)
+    })
+  }
+  const response = sign(request, pairs[1])
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const submitted = await engine.command('manual.submitResponse', {
+      penId,
+      response
+    })
+    assert.equal(submitted.quorum, 1)
+    assert.equal(submitted.required, 2)
+    assert.deepEqual(
+      submitted.signers,
+      pairs.map((pair, index) => ({
+        publicKey: z32.encode(pair.publicKey),
+        signed: index === 1
+      }))
+    )
+    assert.ok(submitted.output)
+  }
+  const shared = engine
+    .snapshot()
+    .pens[0].activity.filter((item) => item.response)
+  assert.equal(shared.length, 1)
+  assert.equal(shared[0].author, z32.encode(pairs[1].publicKey))
+  assert.equal(shared[0].sharedBy, z32.encode(pairs[0].publicKey))
+  assert.equal(shared[0].response, response)
+  await assert.rejects(
+    engine.command('manual.commit', { ...selection, confirmation: 'CONFIRM' }),
+    /quorum/i
+  )
+  const signed = await engine.command('manual.response', { penId, request })
+  await CoreSign.verify(signed.output, request, z32.encode(pairs[0].publicKey))
+  const review = await engine.command('manual.review', selection)
+  assert.equal(review.quorum, 2)
+  assert.deepEqual(
+    review.files.map((file) => file.path),
+    ['/app.js']
+  )
+  const result = await engine.command('manual.commit', {
+    ...selection,
+    confirmation: 'CONFIRM'
+  })
+  assert.equal(result.committed, true)
+  assert.deepEqual(result.db.destCore, unsigned.db.batch)
+  assert.deepEqual(result.blobs.destCore, unsigned.blobs.batch)
+  assert.equal(target.core.length, length)
+  const committedState = engine.snapshot()
+  assert.equal(committedState.pens[0].request, null)
+  const verified = await engine.command('manual.verify', {
+    penId,
+    publicKey: shared[0].author,
+    response: shared[0].response,
+    request: shared[0].request
+  })
+  assert.equal(verified.signer, shared[0].author)
+  assert.deepEqual(engine.snapshot(), committedState)
+  const committed = engine.rooms.get(penId).target
+  assert.equal((await committed.get('/app.js')).toString(), 'hello')
+  assert.equal(await committed.entry('/later.txt'), null)
+  await assert.rejects(
+    engine.command('manual.submitResponse', { penId, response })
+  )
+})
+
+test('CLI manual input rejects a mismatched destination, length, response or confirmation without changing the drive', async (t) => {
+  const { engine, pairs, penId, srcKey, target } = await fixture(t)
+  const source = await engine._source(srcKey)
+  const length = source.core.length
+  const destination = { penId, multisigKey: penId }
+  const command = { ...destination, srcKey, length }
+  const link = `pear://${source.core.fork}.${length}.${srcKey}`
+  for (const invalid of [
+    { multisigKey: srcKey },
+    { length: '' },
+    { length: 0 },
+    { length: -1 },
+    { length: 2.5 },
+    { length: '2abc' },
+    { length: Number.MAX_SAFE_INTEGER + 1 },
+    { srcKey: link, length: length + 1 }
+  ]) {
+    await assert.rejects(
+      engine.command('manual.request', { ...command, ...invalid })
+    )
+  }
+  assert.equal(engine.snapshot().pens[0].request, null)
+  const first = await engine.command('manual.request', {
+    ...command,
+    srcKey: link
+  })
+  const firstId = engine.snapshot().pens[0].request.id
+  await source.put('/next.txt', Buffer.from('second'))
+  const second = await engine.command('manual.request', {
+    ...command,
+    length: source.core.length
+  })
+  const requestId = engine.snapshot().pens[0].request.id
+  assert.notEqual(firstId, requestId)
+  for (const response of ['invalid', sign(first.output, pairs[1])]) {
+    await assert.rejects(
+      engine.command('manual.submitResponse', { penId, response })
+    )
+  }
+  assert.deepEqual(engine.snapshot().pens[0].request.signatures, [])
+  for (const pair of pairs.slice(0, 2)) {
+    await engine.command('manual.submitResponse', {
+      penId,
+      response: sign(second.output, pair)
+    })
+  }
+  for (const method of ['manual.review', 'manual.commit']) {
+    for (const invalid of [{ multisigKey: srcKey }, { requestId: firstId }]) {
+      await assert.rejects(
+        engine.command(method, {
+          ...destination,
+          requestId,
+          confirmation: 'CONFIRM',
+          ...invalid
+        })
+      )
+    }
+  }
+  for (const confirmation of ['', 'confirm', 'COMMIT']) {
+    await assert.rejects(
+      engine.command('manual.commit', {
+        ...destination,
+        requestId,
+        confirmation
+      })
+    )
+  }
+  assert.equal(target.core.length, 0)
+  assert.equal(engine.snapshot().pens[0].request.id, requestId)
+})
+
+test('a manually submitted CLI response syncs to an automatic peer and survives reopening', async (t) => {
+  const { engine, pairs, penId, srcKey } = await fixture(t, 3, {
+    swarm: new LocalSwarm()
+  })
+  await engine.command('settings.update', { mode: 'manual' })
+  const source = await engine._source(srcKey)
+  const { output: request } = await engine.command('manual.request', {
+    penId,
+    multisigKey: penId,
+    srcKey,
+    length: source.core.length
+  })
+  const response = sign(request, pairs[1])
+  await engine.command('manual.submitResponse', { penId, response })
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-cli-response-'))
+  let peer = new PearPen({ dir, network: false, swarm: new LocalSwarm() })
+  t.after(async () => {
+    await peer.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await peer.command('profile.import', keyInput(pairs[2]))
+  await peer.command('pen.add', { multisigKey: penId })
+  const disconnect = await connectLocal(t, engine, peer)
+  await until(() => peer.snapshot().pens[0].request?.signatures.length === 1)
+  disconnect()
+  await peer.close()
+  peer = new PearPen({ dir, network: false })
+  await peer.ready()
+  const pen = peer.snapshot().pens[0]
+  assert.deepEqual(pen.request.signatures, [z32.encode(pairs[1].publicKey)])
+  const shared = pen.activity.filter((event) => event.response === response)
+  assert.equal(shared.length, 1)
+  assert.equal(shared[0].author, z32.encode(pairs[1].publicKey))
+  assert.equal(shared[0].sharedBy, z32.encode(pairs[0].publicKey))
+})
+
 test('successive commits preserve skipped signer indices in metadata and content', async (t) => {
   const { engine, pairs, penId, srcKey, target } = await fixture(t)
   const source = await engine._source(srcKey)
@@ -327,8 +639,13 @@ test('a different source cannot replace data covered by a signing request', asyn
   await other.close()
   const room = engine.rooms.get(penId)
   await engine._publish(room, { type: 'request', srcKey: otherKey, request })
+  const signed = await engine.command('request.sign', {
+    penId,
+    requestId: room.current.id
+  })
+  await CoreSign.verify(signed.output, request, z32.encode(pairs[0].publicKey))
   await assert.rejects(
-    engine.command('request.sign', { penId, requestId: room.current.id }),
+    engine.command('manual.review', { penId, request, srcKey: otherKey }),
     /does not match/
   )
   await assert.rejects(
@@ -342,6 +659,108 @@ test('a different source cannot replace data covered by a signing request', asyn
     /does not match/
   )
   assert.equal(target.core.length, 0)
+})
+
+for (const corrupt of [false, true]) {
+  test(`a ${corrupt ? 'corrupt' : 'failed'} metadata append closes both staging sessions without publishing content`, async (t) => {
+    const { engine, pairs, penId, srcKey, target } = await fixture(t)
+    const { output: request } = await engine.command('manual.request', {
+      penId,
+      srcKey
+    })
+    const options = {
+      penId,
+      request,
+      responses: pairs.slice(0, 2).map((pair) => sign(request, pair)),
+      confirmation: 'COMMIT'
+    }
+    const batches = new Set()
+    const failure = new Error('Append failed')
+    const append = Hypercore.prototype.append
+    const fault = t.mock.method(
+      Hypercore.prototype,
+      'append',
+      function (block) {
+        batches.add(this)
+        if (this.key.equals(target.core.key)) {
+          if (!corrupt) throw failure
+          block = Buffer.from('different metadata')
+        }
+        return append.call(this, block)
+      }
+    )
+    await assert.rejects(
+      engine.command('manual.commit', options),
+      corrupt
+        ? /does not match the signed request/
+        : (error) => error === failure
+    )
+    assert.equal(batches.size, 2)
+    assert.ok([...batches].every((batch) => batch.closed))
+    assert.equal(target.blobsCore.length, 0)
+    assert.equal(target.core.length, 0)
+    fault.mock.restore()
+    assert.equal(
+      (await engine.command('manual.commit', options)).committed,
+      true
+    )
+  })
+}
+
+test('metadata commit failure can retry using already committed content', async (t) => {
+  const { engine, pairs, penId, srcKey } = await fixture(t)
+  const { output: request } = await engine.command('manual.request', {
+    penId,
+    srcKey
+  })
+  const options = {
+    penId,
+    request,
+    responses: pairs.slice(0, 2).map((pair) => sign(request, pair)),
+    confirmation: 'COMMIT'
+  }
+  const room = engine.rooms.get(penId)
+  const fault = t.mock.method(room.target.core, 'commit', async () => null)
+  await assert.rejects(
+    engine.command('manual.commit', options),
+    /changed while committing/
+  )
+  assert.equal(room.target.core.length, 0)
+  assert.ok(room.contentCore.length > 0)
+  fault.mock.restore()
+  const contentCommit = t.mock.method(room.contentCore, 'commit')
+  assert.equal((await engine.command('manual.commit', options)).committed, true)
+  assert.equal(contentCommit.mock.callCount(), 0)
+  assert.equal((await room.target.get('/app.js')).toString(), 'hello')
+})
+
+test('a historical metadata-only commit excludes later source content', async (t) => {
+  const { engine, pairs, penId } = await fixture(t)
+  const writer = new Hyperdrive(engine.store.namespace('metadata-first'))
+  await writer.ready()
+  await writer.symlink('/latest', '/release.txt')
+  const srcKey = `pear://${writer.core.fork}.${writer.core.length}.${z32.encode(writer.key)}`
+  await writer.put('/release.txt', Buffer.from('later release'))
+  await writer.close()
+  const { output: request } = await engine.command('manual.request', {
+    penId,
+    srcKey
+  })
+  const result = await engine.command('manual.commit', {
+    penId,
+    srcKey,
+    request,
+    responses: pairs.slice(0, 2).map((pair) => sign(request, pair)),
+    confirmation: 'COMMIT'
+  })
+  assert.equal(result.content.length, 0)
+  const room = engine.rooms.get(penId)
+  assert.equal(room.contentCore.length, 0)
+  assert.equal(
+    (await room.target.entry('/latest')).value.linkname,
+    '/release.txt'
+  )
+  assert.equal(await room.target.entry('/release.txt'), null)
 })
 
 test('responses and request IDs cannot be replayed across requests or pens', async (t) => {
@@ -440,6 +859,7 @@ test('automatic activity rejects forged authors, outsider keys and premature com
   )
 })
 
+// hypercore-sign v3 compatibility: exercise the unversioned encrypted key layout.
 test('encrypted hypercore-sign imports verify the password and never expose credentials', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-key-test-'))
   const engine = new PearPen({ dir, network: false })
@@ -494,10 +914,8 @@ test('encrypted hypercore-sign imports verify the password and never expose cred
 
 test('generated keys sign real requests and export backups accepted by hypercore-sign', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-generated-test-'))
-  const engine = new PearPen({
-    dir: path.join(dir, 'original'),
-    network: false
-  })
+  const original = { dir: path.join(dir, 'original'), network: false }
+  let engine = new PearPen(original)
   const restored = new PearPen({
     dir: path.join(dir, 'restored'),
     network: false
@@ -515,20 +933,40 @@ test('generated keys sign real requests and export backups accepted by hypercore
     await reimported.close()
     fs.rmSync(dir, { force: true, recursive: true })
   })
-  const state = await engine.command('profile.import', { name: '  Alice  ' })
-  assert.equal(state.profile.name, 'Alice')
-  assert.equal(state.profile.encrypted, false)
+  const { suggestedName } = await engine.command('state.get')
+  assert.match(suggestedName, /^[a-z]+-[a-z]+-\d+-\d+$/)
+  for (const password of [undefined, '', '1234567']) {
+    await assert.rejects(
+      engine.command('profile.import', { password }),
+      /at least 8 bytes/
+    )
+    assert.equal(engine.snapshot().suggestedName, suggestedName)
+    assert.equal(fs.existsSync(path.join(original.dir, 'identity.json')), false)
+  }
+  const password = 'éééé'
+  const state = await engine.command('profile.import', { name: '  ', password })
+  assert.equal(state.profile.username, suggestedName)
+  assert.equal(state.profile.name, suggestedName)
+  assert.equal(state.suggestedName, null)
+  assert.equal(state.profile.encrypted, true)
+  await engine.command('settings.update', { name: 'Alice' })
+  await engine.close()
+  engine = new PearPen(original)
+  await engine.ready()
+  assert.equal(engine.snapshot().profile.name, 'Alice')
+  assert.equal(engine.snapshot().profile.username, suggestedName)
   const publicExport = await engine.command('profile.export', {
     kind: 'public'
   })
-  const privateExport = await engine.command('profile.export', {
+  const encryptedExport = await engine.command('profile.export', {
     kind: 'private'
   })
   assert.equal(publicExport.name, 'default.public')
   assert.equal(publicExport.key, state.profile.publicKey)
-  assert.equal(privateExport.name, 'default')
-  assert.equal(privateExport.encrypted, false)
-  assert.equal(z32.decode(privateExport.key).length, 64)
+  assert.equal(encryptedExport.name, 'default')
+  assert.equal(encryptedExport.encrypted, true)
+  const packed = c.decode(keys.encryptedKey, z32.decode(encryptedExport.key))
+  assert.equal(packed.mem, 16 * 1024 * 1024)
   target = await createDrive(engine.store, [publicExport.key], 'test/generated')
   const source = new Hyperdrive(engine.store.namespace('generated-source'))
   await source.ready()
@@ -541,26 +979,26 @@ test('generated keys sign real requests and export backups accepted by hypercore
     penId,
     srcKey
   })
+  for (const [input, error] of [
+    [undefined, /Enter the password/],
+    ['wrong', /Incorrect private key password/]
+  ]) {
+    await assert.rejects(
+      engine.command('manual.response', { penId, request, password: input }),
+      error
+    )
+    assert.equal(engine.snapshot().pens[0].request.signatures.length, 0)
+  }
   const { output: response } = await engine.command('manual.response', {
     penId,
-    request
-  })
-  await CoreSign.verify(response, request, publicExport.key)
-  await assert.rejects(
-    engine.command('profile.export', { kind: 'private', password: '1234567' }),
-    /at least 8 bytes/
-  )
-  const password = 'éééé'
-  const encryptedExport = await engine.command('profile.export', {
-    kind: 'private',
+    request,
     password
   })
-  assert.equal(encryptedExport.encrypted, true)
-  const packed = c.decode(keys.encryptedKey, z32.decode(encryptedExport.key))
-  assert.equal(packed.mem, 16 * 1024 * 1024)
+  await CoreSign.verify(response, request, publicExport.key)
   const req = SigningRequest.decode(z32.decode(request))
   const securePassword = sodium.sodium_malloc(Buffer.byteLength(password))
   securePassword.write(password)
+  // hypercore-sign v3 compatibility: sign a new backup using the legacy CLI implementation.
   const { sign: cliSign } = require('hypercore-sign/lib/secure')
   const signatures = cliSign(
     SigningRequest.signable(z32.decode(publicExport.key), req),
@@ -586,7 +1024,10 @@ test('generated keys sign real requests and export backups accepted by hypercore
     await restored.command('profile.export', { kind: 'private' }),
     encryptedExport
   )
-  await reimported.command('profile.import', { secretKey: privateExport.key })
+  const rawSecret = keys.unlock(encryptedExport.key, password)
+  const rawKey = z32.encode(rawSecret)
+  rawSecret.fill(0)
+  await reimported.command('profile.import', { secretKey: rawKey })
   await reimported.close()
   reimported = new PearPen({
     dir: path.join(dir, 'reimported'),
@@ -596,26 +1037,36 @@ test('generated keys sign real requests and export backups accepted by hypercore
   assert.equal(reimported.snapshot().profile.publicKey, publicExport.key)
   assert.deepEqual(
     await reimported.command('profile.export', { kind: 'private' }),
-    privateExport
+    {
+      name: 'default',
+      encrypted: false,
+      key: rawKey
+    }
   )
-  for (const key of [privateExport.key, encryptedExport.key]) {
-    await assert.rejects(
-      engine.command('dialog.save', { dialog: { output: key } }),
-      /Private keys cannot be saved/
-    )
-    assert.ok(!JSON.stringify(engine.snapshot()).includes(key))
-    assert.ok(
-      !fs
-        .readFileSync(path.join(dir, 'original/state.json'), 'utf8')
-        .includes(key)
-    )
-  }
+  await assert.rejects(
+    reimported.command('profile.export', {
+      kind: 'private',
+      password: '1234567'
+    }),
+    /at least 8 bytes/
+  )
+  assert.equal(
+    (await reimported.command('profile.export', { kind: 'private', password }))
+      .encrypted,
+    true
+  )
+  await assert.rejects(
+    engine.command('dialog.save', { dialog: { output: encryptedExport.key } }),
+    /Private keys cannot be saved/
+  )
+  assert.ok(!JSON.stringify(engine.snapshot()).includes(encryptedExport.key))
   assert.equal(engine.snapshot().dialog, null)
-  assert.ok(
-    !fs
-      .readFileSync(path.join(dir, 'original/identity.json'), 'utf8')
-      .includes(password)
-  )
+  for (const file of ['state.json', 'identity.json']) {
+    const stored = fs.readFileSync(path.join(original.dir, file), 'utf8')
+    assert.ok(!stored.includes(password))
+    assert.ok(!stored.includes(rawKey))
+    if (file === 'state.json') assert.ok(!stored.includes(encryptedExport.key))
+  }
 })
 
 test('partial or invalid onboarding cannot replace keys or leave a half-imported identity', async (t) => {
@@ -673,7 +1124,10 @@ test('restart repairs an interrupted onboarding profile without replacing its ge
     await engine.close()
     fs.rmSync(dir, { force: true, recursive: true })
   })
-  await engine.command('profile.import', { name: 'Alice' })
+  await engine.command('profile.import', {
+    name: ' Alice ',
+    password: 'test password'
+  })
   const publicExport = await engine.command('profile.export', {
     kind: 'public'
   })
@@ -691,7 +1145,8 @@ test('restart repairs an interrupted onboarding profile without replacing its ge
     engine = new PearPen({ dir, network: false })
     await engine.ready()
     assert.equal(engine.snapshot().profile.publicKey, publicExport.key)
-    assert.equal(engine.snapshot().profile.name, profile?.name || '')
+    assert.equal(engine.snapshot().profile.name, 'Alice')
+    assert.equal(engine.snapshot().profile.username, 'Alice')
     assert.deepEqual(
       await engine.command('profile.export', { kind: 'private' }),
       privateExport
@@ -713,6 +1168,34 @@ test('restart repairs an interrupted onboarding profile without replacing its ge
   }
 })
 
+test('an existing identity without a credential username keeps its keys and display name', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-legacy-'))
+  const engine = new PearPen({ dir, network: false })
+  t.after(async () => {
+    await engine.close()
+    fs.rmSync(dir, { force: true, recursive: true })
+  })
+  const identity = keys.importIdentity(keyInput(crypto.keyPair()))
+  const stored = JSON.stringify(identity)
+  fs.writeFileSync(path.join(dir, 'identity.json'), stored, { mode: 0o600 })
+  fs.writeFileSync(
+    path.join(dir, 'state.json'),
+    JSON.stringify({
+      ...engine.data,
+      profile: { name: 'Alice', publicKey: identity.publicKey }
+    })
+  )
+  const { profile } = await engine.command('state.get')
+  assert.equal(profile.username, identity.publicKey)
+  assert.equal(profile.name, 'Alice')
+  assert.equal(profile.encrypted, false)
+  assert.equal(
+    (await engine.command('profile.export', { kind: 'private' })).key,
+    identity.secretKey
+  )
+  assert.equal(fs.readFileSync(path.join(dir, 'identity.json'), 'utf8'), stored)
+})
+
 test('a missing saved identity produces a recovery error instead of generating replacement keys', async (t) => {
   const dir = fs.mkdtempSync(
     path.join(os.tmpdir(), 'pear-pen-missing-identity-test-')
@@ -722,7 +1205,7 @@ test('a missing saved identity produces a recovery error instead of generating r
     await engine.close()
     fs.rmSync(dir, { force: true, recursive: true })
   })
-  await engine.command('profile.import')
+  await engine.command('profile.import', { password: 'test password' })
   await engine.close()
   fs.unlinkSync(path.join(dir, 'identity.json'))
   const state = fs.readFileSync(path.join(dir, 'state.json'), 'utf8')
@@ -763,6 +1246,19 @@ class LocalSwarm extends EventEmitter {
   }
 }
 
+class DiscoveringSwarm extends LocalSwarm {
+  constructor() {
+    super()
+    this.discovery = new Promise((resolve, reject) => {
+      this.finishDiscovery = resolve
+      this.failDiscovery = reject
+    })
+  }
+  flush() {
+    return this.discovery
+  }
+}
+
 async function until(condition) {
   const end = Date.now() + 5000
   while (!condition()) {
@@ -787,6 +1283,1341 @@ async function connectLocal(t, leftEngine, rightEngine) {
   t.after(disconnect)
   return disconnect
 }
+
+test('a first signing command waits for discovery and a late metadata peer', async (t) => {
+  const {
+    engine: alice,
+    pairs,
+    penId,
+    srcKey
+  } = await fixture(t, 2, {
+    swarm: new LocalSwarm()
+  })
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-discovery-'))
+  const swarm = new DiscoveringSwarm()
+  const bob = new PearPen({ dir, network: false, swarm, timeout: 3000 })
+  t.after(async () => {
+    swarm.finishDiscovery()
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await bob.command('profile.import', keyInput(pairs[1]))
+  await bob.command('pen.add', { multisigKey: penId })
+  const room = bob.rooms.get(penId)
+  assert.equal(room.target.core.manifest, null)
+  let settled = false
+  const request = bob.command('manual.request', { penId, srcKey })
+  request.then(
+    () => {
+      settled = true
+    },
+    () => {
+      settled = true
+    }
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(
+    settled,
+    false,
+    'the command must not fail before discovery finishes'
+  )
+  await connectLocal(t, alice, bob)
+  swarm.finishDiscovery()
+  const result = await request
+  assert.ok(result.output)
+  assert.equal(bob.snapshot().pens[0].quorum, 2)
+  assert.equal(room.target.core._findingPeers, 0)
+})
+
+test('unversioned requests wait for discovery before pinning a cached older source head', async (t) => {
+  const {
+    engine: alice,
+    pairs,
+    penId,
+    srcKey
+  } = await fixture(t, 2, { swarm: new LocalSwarm() })
+  const source = await alice._source(srcKey)
+  const oldLength = source.core.length
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'pear-pen-latest-discovery-')
+  )
+  const swarm = new DiscoveringSwarm()
+  const bob = new PearPen({ dir, network: false, swarm, timeout: 3000 })
+  t.after(async () => {
+    swarm.finishDiscovery()
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await bob.command('profile.import', keyInput(pairs[1]))
+  await bob.command('pen.add', { multisigKey: penId })
+  const disconnect = await connectLocal(t, alice, bob)
+  await until(() => bob.rooms.get(penId).manifest)
+  const remote = await bob._source(`pear://0.${oldLength}.${srcKey}`)
+  disconnect()
+  await until(() => remote.core.peers.length === 0)
+  await source.put('/app.js', Buffer.from('latest after initial cached head'))
+  const latest = source.core.length
+  let settled = false
+  const request = bob.command('request.create', { penId, srcKey })
+  request.then(
+    () => {
+      settled = true
+    },
+    () => {
+      settled = true
+    }
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(settled, false)
+  await connectLocal(t, alice, bob)
+  swarm.finishDiscovery()
+  await request
+  assert.equal(
+    bob.snapshot().pens[0].request.srcKey,
+    `pear://0.${latest}.${srcKey}`
+  )
+  assert.equal(bob.snapshot().pens[0].request.length, latest)
+})
+
+test('a cached unversioned source refreshes completed discovery before selecting its head', async (t) => {
+  class RefreshingSwarm extends LocalSwarm {
+    constructor() {
+      super()
+      this.refreshes = 0
+      this.lookup = new Promise((resolve) => {
+        this.finishRefresh = resolve
+      })
+    }
+    join() {
+      return {
+        flushed: async () => true,
+        destroy: async () => {},
+        refresh: async () => {
+          this.refreshes++
+          await this.lookup
+        }
+      }
+    }
+    async flush() {
+      return true
+    }
+  }
+  const {
+    engine: alice,
+    pairs,
+    penId,
+    srcKey
+  } = await fixture(t, 2, { swarm: new LocalSwarm() })
+  const source = await alice._source(srcKey)
+  const oldLength = source.core.length
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-refresh-source-'))
+  const swarm = new RefreshingSwarm()
+  const bob = new PearPen({ dir, network: false, swarm, timeout: 3000 })
+  t.after(async () => {
+    swarm.finishRefresh()
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await bob.command('profile.import', keyInput(pairs[1]))
+  await bob.command('pen.add', { multisigKey: penId })
+  const disconnect = await connectLocal(t, alice, bob)
+  await until(() => bob.rooms.get(penId).manifest)
+  const remote = await bob._source(`pear://0.${oldLength}.${srcKey}`)
+  await until(() => !bob.driveReady.has(srcKey))
+  disconnect()
+  await until(() => remote.core.peers.length === 0)
+  await source.put(
+    '/app.js',
+    Buffer.from('new writer head after previous lookup')
+  )
+  const latest = source.core.length
+  let settled = false
+  const request = bob.command('request.create', { penId, srcKey })
+  request.then(
+    () => {
+      settled = true
+    },
+    () => {
+      settled = true
+    }
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(swarm.refreshes, 1)
+  assert.equal(settled, false)
+  await connectLocal(t, alice, bob)
+  swarm.finishRefresh()
+  await request
+  assert.equal(
+    bob.snapshot().pens[0].request.srcKey,
+    `pear://0.${latest}.${srcKey}`
+  )
+})
+
+for (const failure of [
+  'failed',
+  'timed out',
+  'refresh returned false',
+  'discovery flush returned false',
+  'swarm flush returned false'
+]) {
+  test(`latest-source discovery that ${failure} cannot reuse a cached head`, async (t) => {
+    class FailingRefreshSwarm extends LocalSwarm {
+      constructor() {
+        super()
+        this.failure = null
+      }
+      join() {
+        return {
+          flushed: async () =>
+            this.failure !== 'discovery flush returned false',
+          destroy: async () => {},
+          refresh: async () => {
+            if (this.failure === 'refresh returned false') return false
+            if (this.failure === 'failed')
+              throw new Error('Local test lookup failed')
+            if (this.failure === 'timed out') await new Promise(() => {})
+          }
+        }
+      }
+      async flush() {
+        return this.failure !== 'swarm flush returned false'
+      }
+    }
+    const swarm = new FailingRefreshSwarm()
+    const { engine, penId, srcKey } = await fixture(t, 1, { swarm })
+    const source = await engine._source(srcKey)
+    const link = `pear://${source.core.fork}.${source.core.length}.${srcKey}`
+    const before = JSON.stringify(engine.snapshot())
+    swarm.failure = failure
+    engine.timeout = 80
+    await assert.rejects(
+      engine.command('request.create', { penId, srcKey }),
+      /Could not discover the latest source version/
+    )
+    assert.equal(JSON.stringify(engine.snapshot()), before)
+    assert.equal(engine.rooms.get(penId).events.length, 0)
+    assert.equal(source.core._findingPeers, 0)
+    const { output } = await engine.command('manual.request', {
+      penId,
+      srcKey: link
+    })
+    assert.ok(output)
+    assert.equal(engine.snapshot().pens[0].request.srcKey, link)
+    assert.deepEqual(engine.snapshot().pens[0].request.signatures, [])
+  })
+}
+
+test('a cached exact source waits for a later peer to provide its newly requested version', async (t) => {
+  const {
+    engine: alice,
+    pairs,
+    penId,
+    srcKey
+  } = await fixture(t, 2, { swarm: new LocalSwarm() })
+  const source = await alice._source(srcKey)
+  const oldLength = source.core.length
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'pear-pen-new-source-version-')
+  )
+  const bob = new PearPen({
+    dir,
+    network: false,
+    swarm: new LocalSwarm(),
+    timeout: 1000
+  })
+  t.after(async () => {
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await bob.command('profile.import', keyInput(pairs[1]))
+  await bob.command('pen.add', { multisigKey: penId })
+  const disconnect = await connectLocal(t, alice, bob)
+  await until(() => bob.rooms.get(penId).manifest)
+  const remote = await bob._source(`pear://0.${oldLength}.${srcKey}`)
+  disconnect()
+  await until(() => remote.core.peers.length === 0)
+  await source.put(
+    '/app.js',
+    Buffer.from('new version after the first reader disconnected')
+  )
+  const link = `pear://0.${source.core.length}.${srcKey}`
+  let settled = false
+  const request = bob.command('request.create', { penId, srcKey: link })
+  request.then(
+    () => {
+      settled = true
+    },
+    () => {
+      settled = true
+    }
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(
+    settled,
+    false,
+    'a cached older head is not the requested version'
+  )
+  await connectLocal(t, alice, bob)
+  await request
+  assert.equal(bob.snapshot().pens[0].request.srcKey, link)
+  assert.equal(bob.rooms.get(penId).target.core.length, 0)
+})
+
+test('a missing source configuration can be added and retried at a new version without restarting', async (t) => {
+  const {
+    engine: alice,
+    pairs,
+    srcKey
+  } = await fixture(t, 2, { swarm: new LocalSwarm() })
+  const publicKeys = pairs.map((pair) => z32.encode(pair.publicKey))
+  const namespace = 'test/retry-after-missing-source-config'
+  const penId = z32.encode(Hypercore.key(manifestFor(publicKeys, namespace, 2)))
+  await alice.command('pen.add', { multisigKey: penId })
+  const source = await alice._source(srcKey)
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'pear-pen-retry-source-config-')
+  )
+  const bob = new PearPen({
+    dir,
+    network: false,
+    swarm: new LocalSwarm(),
+    timeout: 1000
+  })
+  t.after(async () => {
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await bob.command('profile.import', keyInput(pairs[1]))
+  await bob.command('pen.add', { multisigKey: penId })
+  const disconnect = await connectLocal(t, alice, bob)
+  const initial = `pear://0.${source.core.length}.${srcKey}`
+  await assert.rejects(
+    bob.command('manual.request', { penId, srcKey: initial }),
+    /missing \/pear.json/
+  )
+  const cached = bob.drives.get(srcKey)
+  assert.equal(cached.closed, false)
+  disconnect()
+  await until(() => cached.core.peers.length === 0)
+  await source.put(
+    '/pear.json',
+    Buffer.from(
+      JSON.stringify({ multisig: { namespace, publicKeys, quorum: 2 } })
+    )
+  )
+  const link = `pear://0.${source.core.length}.${srcKey}`
+  let settled = false
+  const request = bob.command('manual.request', { penId, srcKey: link })
+  request.then(
+    () => {
+      settled = true
+    },
+    () => {
+      settled = true
+    }
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(settled, false)
+  await connectLocal(t, alice, bob)
+  const result = await request
+  assert.ok(result.output)
+  assert.equal(bob.drives.get(srcKey), cached)
+  assert.equal(bob.snapshot().pens[0].request.srcKey, link)
+  assert.equal(bob.snapshot().pens[0].quorum, 2)
+  assert.deepEqual(bob.snapshot().pens[0].request.signatures, [])
+})
+
+for (const exact of [false, true]) {
+  test(`a cold ${exact ? 'versioned' : 'latest'} source waits for a peer after an initial failed lookup`, async (t) => {
+    class RetryableSwarm extends LocalSwarm {
+      constructor() {
+        super()
+        this.lookups = 0
+      }
+      join() {
+        return {
+          destroy: async () => {},
+          refresh: async () => this.connections.size > 0,
+          flushed: async () => {
+            this.lookups++
+            return this.connections.size > 0
+          }
+        }
+      }
+      async flush() {
+        return true
+      }
+    }
+    const {
+      engine: alice,
+      pairs,
+      penId,
+      srcKey
+    } = await fixture(t, 2, { swarm: new LocalSwarm() })
+    const source = await alice._source(srcKey)
+    const link = `pear://0.${source.core.length}.${srcKey}`
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-cold-retry-'))
+    const swarm = new RetryableSwarm()
+    const bob = new PearPen({ dir, network: false, swarm, timeout: 1000 })
+    t.after(async () => {
+      await bob.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    })
+    await bob.command('profile.import', keyInput(pairs[1]))
+    await bob.command('pen.add', { multisigKey: penId })
+    await bob.command('pen.configure', {
+      penId,
+      config: JSON.stringify({
+        multisig: {
+          namespace: 'test/pear-pen',
+          publicKeys: pairs.map((pair) => z32.encode(pair.publicKey)),
+          quorum: 2
+        }
+      })
+    })
+    let settled = false
+    const request = bob.command('request.create', {
+      penId,
+      srcKey: exact ? link : srcKey
+    })
+    request.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
+    await until(() => bob.drives.has(srcKey) && swarm.lookups > 0)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(bob.drives.get(srcKey).core.length, 0)
+    assert.equal(settled, false)
+    const left = new SecretStream(true),
+      right = new SecretStream(false)
+    left.on('error', () => {})
+    right.on('error', () => {})
+    left.rawStream.pipe(right.rawStream).pipe(left.rawStream)
+    await Promise.all([left.opened, right.opened])
+    t.after(() => {
+      left.destroy()
+      right.destroy()
+    })
+    alice.swarm.connections.add(left)
+    bob.swarm.connections.add(right)
+    alice.swarm.emit('connection', left)
+    bob.swarm.emit('connection', right)
+    await request
+    assert.equal(bob.snapshot().pens[0].request.srcKey, link)
+    assert.equal(bob.drives.get(srcKey).core.fork, 0)
+  })
+}
+
+test('a source that timed out can connect and be retried using the same cached drive', async (t) => {
+  const {
+    engine: alice,
+    pairs,
+    penId,
+    srcKey
+  } = await fixture(t, 2, { swarm: new LocalSwarm() })
+  const source = await alice._source(srcKey)
+  const link = `pear://0.${source.core.length}.${srcKey}`
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'pear-pen-offline-then-retry-')
+  )
+  const bob = new PearPen({
+    dir,
+    network: false,
+    swarm: new LocalSwarm(),
+    timeout: 60
+  })
+  t.after(async () => {
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await bob.command('profile.import', keyInput(pairs[1]))
+  await bob.command('pen.add', { multisigKey: penId })
+  const start = Date.now()
+  await assert.rejects(
+    bob.command('request.create', { penId, srcKey: link }),
+    /version is unavailable/
+  )
+  assert.ok(Date.now() - start >= 40)
+  const cached = bob.drives.get(srcKey)
+  assert.equal(cached.closed, false)
+  bob.timeout = 1000
+  await connectLocal(t, alice, bob)
+  await bob.command('request.create', { penId, srcKey: link })
+  assert.equal(bob.drives.get(srcKey), cached)
+  assert.equal(bob.snapshot().pens[0].request.srcKey, link)
+})
+
+test('metadata discovery and update deadlines release requests without closing the drive', async (t) => {
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'pear-pen-offline-discovery-')
+  )
+  const swarm = new DiscoveringSwarm()
+  const engine = new PearPen({ dir, network: false, swarm, timeout: 80 })
+  t.after(async () => {
+    swarm.finishDiscovery()
+    await engine.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await engine.command('profile.import', keyInput(crypto.keyPair()))
+  const penId = z32.encode(crypto.randomBytes(32))
+  await engine.command('pen.add', { multisigKey: penId })
+  const room = engine.rooms.get(penId)
+  const core = room.target.core
+  assert.ok(core._findingPeers > 0)
+  const done = core.findingPeers()
+  const sessions = []
+  const session = core.session.bind(core)
+  core.session = (...args) => {
+    const child = session(...args)
+    sessions.push(child)
+    return child
+  }
+  const start = Date.now()
+  await assert.rejects(
+    engine._manifest(room, true),
+    /multisig drive manifest is unavailable/
+  )
+  assert.ok(
+    Date.now() - start < 1000,
+    'an unresolved lookup must not hang a command'
+  )
+  assert.equal(core.closed, false)
+  assert.ok(sessions.length > 0)
+  assert.ok(
+    sessions.every((child) => child.closed && child.activeRequests.length === 0)
+  )
+  assert.equal(
+    core._findingPeers,
+    1,
+    'the engine discovery hold expires independently'
+  )
+  done()
+  assert.equal(core._findingPeers, 0)
+  await engine.command('pen.remove', { penId })
+})
+
+test('closing a drive releases its in-flight discovery before the swarm finishes', async (t) => {
+  const swarm = new DiscoveringSwarm()
+  const { engine, penId } = await fixture(t, 1, { swarm })
+  const drive = engine.drives.get(penId)
+  assert.ok(drive.core._findingPeers > 0)
+  await engine.close()
+  assert.equal(drive.core._findingPeers, 0)
+  swarm.finishDiscovery()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(drive.core._findingPeers, 0)
+})
+
+test('a failed discovery releases its per-drive hold without an unhandled rejection', async (t) => {
+  const swarm = new DiscoveringSwarm()
+  const { engine, penId } = await fixture(t, 1, { swarm, timeout: 80 })
+  const drive = engine.drives.get(penId)
+  assert.ok(drive.core._findingPeers > 0)
+  swarm.failDiscovery(new Error('Local test discovery failed'))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.ok(drive.core._findingPeers > 0)
+  await until(() => drive.core._findingPeers === 0)
+  assert.equal(drive.core._findingPeers, 0)
+  assert.equal(drive.closed, false)
+})
+
+test('connected key-only peers do not count as an available drive manifest', async (t) => {
+  const { engine: alice, pairs } = await fixture(t, 2, {
+    swarm: new LocalSwarm()
+  })
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-key-only-peer-'))
+  const bob = new PearPen({
+    dir,
+    network: false,
+    swarm: new LocalSwarm(),
+    timeout: 80
+  })
+  t.after(async () => {
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await bob.command('profile.import', keyInput(pairs[1]))
+  const penId = z32.encode(crypto.randomBytes(32))
+  await alice.command('pen.add', { multisigKey: penId })
+  await bob.command('pen.add', { multisigKey: penId })
+  await connectLocal(t, alice, bob)
+  const room = bob.rooms.get(penId)
+  await until(
+    () =>
+      bob.snapshot().pens[0].peers === 1 && room.target.core.peers.length > 0
+  )
+  assert.equal(room.target.core.manifest, null)
+  const start = Date.now()
+  await assert.rejects(
+    bob._manifest(room, true),
+    /manifest is unavailable.*seeding the complete drive/
+  )
+  assert.ok(Date.now() - start < 1000)
+  assert.equal(bob.snapshot().pens[0].quorum, 0)
+  assert.deepEqual(bob.snapshot().pens[0].signers, [])
+  assert.equal(room.events.length, 0)
+})
+
+for (const manual of [true, false]) {
+  test(`${manual ? 'manual' : 'automatic'} signing learns an unknown pen's manifest from its authenticated request without source access`, async (t) => {
+    const { engine: alice, pairs, penId, srcKey } = await fixture(t, 2)
+    const { output: request } = await alice.command('manual.request', {
+      penId,
+      srcKey
+    })
+    const event = alice.rooms.get(penId).events[0]
+    const dir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'pear-pen-request-manifest-')
+    )
+    const bob = new PearPen({ dir, network: false, timeout: 100 })
+    t.after(async () => {
+      await bob.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    })
+    await bob.command('profile.import', keyInput(pairs[1]))
+    await bob.command('pen.add', { multisigKey: penId })
+    const room = bob.rooms.get(penId)
+    assert.equal(room.target.core.manifest, null)
+    bob._source =
+      bob._bootstrapManifest =
+      bob._update =
+        async () => {
+          throw new Error(
+            'Signing must not fetch source files or target metadata'
+          )
+        }
+    let result
+    if (manual)
+      result = await bob.command('manual.response', { penId, request })
+    else {
+      await bob._receive(room, event)
+      assert.equal(room.current.id, event.id)
+      result = await bob.command('request.sign', { penId, requestId: event.id })
+    }
+    await CoreSign.verify(
+      result.output,
+      request,
+      z32.encode(pairs[1].publicKey)
+    )
+    assert.equal(room.manifest.quorum, 2)
+    assert.equal(room.target.core.length, 0)
+    assert.equal(room.contentCore.length, 0)
+    assert.equal(bob.drives.has(srcKey), false)
+    assert.equal(room.pen.config, undefined)
+  })
+}
+
+test('manual review uses the pasted request for a link-only pen without source configuration', async (t) => {
+  const { engine, pairs, srcKey } = await fixture(t, 2)
+  const manifest = manifestFor(
+    pairs.map((pair) => z32.encode(pair.publicKey)),
+    'test/link-only-review'
+  )
+  const penId = z32.encode(Hypercore.key(manifest))
+  const source = await engine._source(srcKey)
+  const request = z32.encode(
+    await SigningRequest.generateDrive(source, { manifest })
+  )
+  await engine.command('pen.add', { multisigKey: penId })
+  const room = engine.rooms.get(penId)
+  assert.equal(room.target.core.manifest, null)
+  const review = await engine.command('manual.review', {
+    penId,
+    request,
+    srcKey
+  })
+  assert.deepEqual(
+    review.files.map((file) => file.path),
+    ['/app.js']
+  )
+  assert.equal(review.committed, false)
+  assert.equal(review.quorum, 0)
+  assert.equal(room.pen.config, undefined)
+  assert.equal(room.target.core.length, 0)
+})
+
+test('invalid self-describing requests cannot initialize an unknown pen', async (t) => {
+  const { engine: alice, pairs, penId, srcKey } = await fixture(t, 2)
+  const { output: request } = await alice.command('manual.request', {
+    penId,
+    srcKey
+  })
+  const source = await alice._source(srcKey)
+  const wrong = manifestFor(
+    pairs.map((pair) => z32.encode(pair.publicKey)),
+    'wrong/request/manifest',
+    2
+  )
+  const wrongRequest = z32.encode(
+    await SigningRequest.generateDrive(source, { manifest: wrong })
+  )
+  const unsupported = { ...wrong, version: 0 }
+  const unsupportedKey = z32.encode(Hypercore.key(unsupported))
+  const unsupportedRequest = z32.encode(
+    await SigningRequest.generateDrive(source, { manifest: unsupported })
+  )
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'pear-pen-invalid-request-manifest-')
+  )
+  const bob = new PearPen({ dir, network: false })
+  t.after(async () => {
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await bob.command('profile.import', keyInput(pairs[1]))
+  await bob.command('pen.add', { multisigKey: penId })
+  await bob.command('pen.add', { multisigKey: unsupportedKey })
+  const room = bob.rooms.get(penId)
+  const state = fs.readFileSync(path.join(dir, 'state.json'))
+  const event = alice.rooms.get(penId).events[0]
+  await assert.rejects(
+    bob._receive(room, { ...event, signature: z32.encode(Buffer.alloc(64)) }),
+    /Invalid activity signature/
+  )
+  const outsider = protocol.create(
+    keys.importIdentity(keyInput(crypto.keyPair())),
+    penId,
+    { type: 'request', srcKey, request },
+    1
+  )
+  await assert.rejects(
+    bob._receive(room, outsider),
+    /Invalid activity signature/
+  )
+  const mismatched = protocol.create(
+    alice.identity,
+    penId,
+    { type: 'request', srcKey, request: wrongRequest },
+    1
+  )
+  await assert.rejects(
+    bob._receive(room, mismatched),
+    /different multisig drive/
+  )
+  for (const method of ['manual.response', 'manual.review']) {
+    await assert.rejects(
+      bob.command(method, { penId, request: wrongRequest }),
+      /different multisig drive/
+    )
+    await assert.rejects(
+      bob.command(method, {
+        penId: unsupportedKey,
+        request: unsupportedRequest
+      }),
+      /supported multisig drive manifest/
+    )
+  }
+  const unsupportedEvent = protocol.create(
+    alice.identity,
+    unsupportedKey,
+    { type: 'request', srcKey, request: unsupportedRequest },
+    1
+  )
+  await assert.rejects(
+    bob._receive(bob.rooms.get(unsupportedKey), unsupportedEvent),
+    /supported multisig drive manifest/
+  )
+  for (const candidate of bob.rooms.values()) {
+    assert.equal(candidate.target.core.manifest, null)
+    assert.equal(candidate.target.core.length, 0)
+    assert.equal(candidate.contentCore, undefined)
+    assert.equal(candidate.events.length, 0)
+  }
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'state.json')), state)
+})
+
+test('a verified public configuration bootstraps an empty first-release drive and its peers', async (t) => {
+  const {
+    engine: alice,
+    pairs,
+    srcKey
+  } = await fixture(t, 2, {
+    swarm: new LocalSwarm()
+  })
+  const publicKeys = pairs.map((pair) => z32.encode(pair.publicKey))
+  const namespace = 'test/first-release'
+  const manifest = manifestFor(publicKeys, namespace, 2)
+  const penId = z32.encode(Hypercore.key(manifest))
+  const config = JSON.stringify({
+    multisig: { namespace, publicKeys, quorum: 2 }
+  })
+  await alice.command('pen.add', { multisigKey: penId, quorum: 2 })
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-first-release-'))
+  let bob = new PearPen({ dir, network: false, swarm: new LocalSwarm() })
+  t.after(async () => {
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await bob.command('profile.import', keyInput(pairs[1]))
+  await bob.command('pen.add', { multisigKey: penId })
+  const disconnect = await connectLocal(t, alice, bob)
+  await until(() => bob.snapshot().pens[0].peers === 1)
+  const room = alice.rooms.get(penId)
+  assert.equal(room.target.core.manifest, null)
+  assert.equal(bob.rooms.get(penId).target.core.manifest, null)
+  const state = await alice.command('pen.configure', { penId, config })
+  const pen = state.pens.find((item) => item.id === penId)
+  assert.equal(pen.quorum, 2)
+  assert.deepEqual(pen.signers, publicKeys)
+  assert.equal(pen.request, null)
+  assert.deepEqual(pen.activity, [])
+  assert.equal(room.target.core.length, 0)
+  assert.equal(room.contentCore.length, 0)
+  assert.equal(room.events.length, 0)
+  await until(() => bob.snapshot().pens[0].quorum === 2)
+  assert.deepEqual(bob.snapshot().pens[0].signers, publicKeys)
+  assert.equal(bob.rooms.get(penId).target.core.length, 0)
+  disconnect()
+  await bob.close()
+  bob = new PearPen({ dir, network: false, swarm: new LocalSwarm() })
+  await bob.ready()
+  assert.equal(bob.snapshot().pens[0].quorum, 2)
+  assert.deepEqual(bob.snapshot().pens[0].signers, publicKeys)
+  await bob.command('pen.configure', { penId, config })
+  assert.deepEqual(bob.snapshot().pens[0].activity, [])
+  const { output: request } = await alice.command('manual.request', {
+    penId,
+    srcKey
+  })
+  const review = await alice.command('manual.review', {
+    penId,
+    request,
+    srcKey,
+    responses: pairs.map((pair) => sign(request, pair))
+  })
+  assert.equal(review.files[0].path, '/app.js')
+  assert.equal(room.target.core.length, 0)
+})
+
+test('invalid or mismatched configurations cannot mutate unknown or known drive manifests', async (t) => {
+  const { engine, pairs, penId } = await fixture(t)
+  const publicKeys = pairs.map((pair) => z32.encode(pair.publicKey))
+  const namespace = 'test/configuration-validation'
+  const manifest = manifestFor(publicKeys, namespace, 2)
+  const unknownKey = z32.encode(Hypercore.key(manifest))
+  await engine.command('pen.add', { multisigKey: unknownKey })
+  const room = engine.rooms.get(unknownKey)
+  const state = fs.readFileSync(path.join(engine.dir, 'state.json'), 'utf8')
+  const knownManifest = JSON.stringify(engine.rooms.get(penId).manifest)
+  let initializations = 0
+  const get = room.target.corestore.get.bind(room.target.corestore)
+  room.target.corestore.get = (...args) => {
+    initializations++
+    return get(...args)
+  }
+  const bad = [
+    null,
+    {},
+    '',
+    '{',
+    ' '.repeat(64 * 1024 + 1),
+    JSON.stringify({ multisig: { namespace: '', publicKeys, quorum: 2 } }),
+    JSON.stringify({ multisig: { namespace, publicKeys: [], quorum: 1 } }),
+    JSON.stringify({
+      multisig: {
+        namespace,
+        publicKeys: [publicKeys[0], publicKeys[0]],
+        quorum: 2
+      }
+    }),
+    JSON.stringify({
+      multisig: { namespace, publicKeys: ['invalid-key'], quorum: 1 }
+    }),
+    ...[0, -1, 1.5, '2', publicKeys.length + 1].map((quorum) =>
+      JSON.stringify({ multisig: { namespace, publicKeys, quorum } })
+    ),
+    JSON.stringify({
+      multisig: { namespace: namespace + '/different', publicKeys, quorum: 2 }
+    }),
+    JSON.stringify({
+      multisig: { namespace, publicKeys: [...publicKeys].reverse(), quorum: 2 }
+    }),
+    JSON.stringify({ multisig: { namespace, publicKeys, quorum: 1 } })
+  ]
+  await assert.rejects(
+    engine.command('pen.configure', {
+      penId: unknownKey,
+      config: JSON.stringify({
+        multisig: { namespace: 'é'.repeat(33000), publicKeys, quorum: 2 }
+      })
+    }),
+    /64 KB/
+  )
+  for (const config of bad) {
+    await assert.rejects(
+      engine.command('pen.configure', { penId: unknownKey, config })
+    )
+    assert.equal(room.target.core.manifest, null)
+    assert.equal(room.target.core.length, 0)
+    assert.equal(room.events.length, 0)
+  }
+  assert.equal(initializations, 0)
+  const wrongForKnown = JSON.stringify({
+    multisig: { namespace, publicKeys, quorum: 2 }
+  })
+  await assert.rejects(
+    engine.command('pen.configure', { penId, config: wrongForKnown }),
+    /does not match/
+  )
+  assert.equal(JSON.stringify(engine.rooms.get(penId).manifest), knownManifest)
+  assert.equal(
+    fs.readFileSync(path.join(engine.dir, 'state.json'), 'utf8'),
+    state
+  )
+})
+
+for (const method of ['request.create', 'manual.request']) {
+  test(`${method} automatically bootstraps from a remote source /pear.json`, async (t) => {
+    const {
+      engine: alice,
+      pairs,
+      srcKey
+    } = await fixture(t, 2, {
+      swarm: new LocalSwarm()
+    })
+    const publicKeys = pairs.map((pair) => z32.encode(pair.publicKey))
+    const namespace = 'test/automatic-source-configuration'
+    const manifest = manifestFor(publicKeys, namespace, 2)
+    const penId = z32.encode(Hypercore.key(manifest))
+    const config = JSON.stringify({
+      multisig: { namespace, publicKeys, quorum: 2 }
+    })
+    const source = await alice._source(srcKey)
+    if (method === 'manual.request') {
+      const blob = await source.blobs.put(Buffer.from(config), {
+        blockMap: true
+      })
+      await source.putEntry('/pear.json', { blob })
+    } else {
+      await source.put('/pear.json', Buffer.from(config))
+    }
+    await alice.command('pen.add', { multisigKey: penId })
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-auto-config-'))
+    const bob = new PearPen({ dir, network: false, swarm: new LocalSwarm() })
+    t.after(async () => {
+      await bob.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    })
+    await bob.command('profile.import', keyInput(pairs[1]))
+    await bob.command('pen.add', { multisigKey: penId })
+    await connectLocal(t, alice, bob)
+    await until(() => bob.snapshot().pens[0].peers === 1)
+    const room = bob.rooms.get(penId)
+    assert.equal(room.target.core.manifest, null)
+    assert.equal(bob.drives.has(srcKey), false)
+    const result = await bob.command(method, { penId, srcKey })
+    const pen = bob.snapshot().pens[0]
+    assert.deepEqual(pen.signers, publicKeys)
+    assert.equal(pen.quorum, 2)
+    assert.ok(pen.request)
+    assert.deepEqual(pen.request.signatures, [])
+    if (method === 'manual.request')
+      assert.equal(result.output, pen.request.request)
+    assert.equal(room.target.core.length, 0)
+    assert.equal(room.contentCore.length, 0)
+    assert.equal(room.events.length, 1)
+    await until(() => alice.rooms.get(penId).manifest?.quorum === 2)
+    assert.equal(alice.rooms.get(penId).target.core.length, 0)
+  })
+}
+
+test('automatic configuration rejects missing, oversized, malformed and wrong-key files before target mutation', async (t) => {
+  const { engine, pairs, srcKey } = await fixture(t)
+  const publicKeys = pairs.map((pair) => z32.encode(pair.publicKey))
+  const namespace = 'test/invalid-source-configuration'
+  const penId = z32.encode(Hypercore.key(manifestFor(publicKeys, namespace, 2)))
+  await engine.command('pen.add', { multisigKey: penId })
+  const room = engine.rooms.get(penId)
+  const source = await engine._source(srcKey)
+  const state = fs.readFileSync(path.join(engine.dir, 'state.json'), 'utf8')
+  let initializations = 0
+  const getCore = room.target.corestore.get.bind(room.target.corestore)
+  room.target.corestore.get = (...args) => {
+    initializations++
+    return getCore(...args)
+  }
+  let reads = 0
+  const checkout = source.checkout.bind(source)
+  source.checkout = (...args) => {
+    const view = checkout(...args)
+    const get = view.get.bind(view)
+    view.get = (entry, options) => {
+      reads++
+      assert.equal(typeof entry, 'object')
+      assert.equal(options.prefetch, false)
+      assert.ok(options.length <= 64 * 1024)
+      assert.equal(options.timeout, engine.timeout)
+      return get(entry, options)
+    }
+    return view
+  }
+  await assert.rejects(
+    engine.command('request.create', { penId, srcKey }),
+    /source drive is missing \/pear.json.*import it in Pen details/
+  )
+  assert.equal(reads, 0)
+  await source.put('/pear.json', Buffer.alloc(64 * 1024 + 1))
+  await assert.rejects(
+    engine.command('request.create', { penId, srcKey }),
+    /64 KB/
+  )
+  assert.equal(reads, 0, 'large plain blob is rejected before its data is read')
+  const blob = await source.blobs.put(Buffer.alloc(64 * 1024 + 1), {
+    blockMap: true
+  })
+  assert.ok(blob.byteLength < 64 * 1024)
+  await source.putEntry('/pear.json', { blob })
+  await assert.rejects(
+    engine.command('request.create', { penId, srcKey }),
+    /64 KB/
+  )
+  assert.equal(
+    reads,
+    0,
+    'block-map logical size is checked before reading its file data'
+  )
+  for (const config of [
+    '{',
+    JSON.stringify({
+      multisig: { namespace: namespace + '/wrong', publicKeys, quorum: 2 }
+    })
+  ]) {
+    await source.put('/pear.json', Buffer.from(config))
+    await assert.rejects(engine.command('request.create', { penId, srcKey }))
+    assert.equal(room.target.core.manifest, null)
+    assert.equal(room.target.core.length, 0)
+    assert.equal(room.contentCore, undefined)
+    assert.equal(room.events.length, 0)
+  }
+  assert.equal(reads, 2)
+  assert.equal(initializations, 0)
+  assert.equal(
+    fs.readFileSync(path.join(engine.dir, 'state.json'), 'utf8'),
+    state
+  )
+})
+
+test('a verified imported manifest takes priority over absent or conflicting source configuration', async (t) => {
+  const { engine, pairs, srcKey } = await fixture(t)
+  const publicKeys = pairs.map((pair) => z32.encode(pair.publicKey))
+  const namespace = 'test/imported-manifest-priority'
+  const manifest = manifestFor(publicKeys, namespace, 2)
+  const penId = z32.encode(Hypercore.key(manifest))
+  await engine.command('pen.add', { multisigKey: penId })
+  await engine.command('pen.configure', {
+    penId,
+    config: JSON.stringify({ multisig: { namespace, publicKeys, quorum: 2 } })
+  })
+  const room = engine.rooms.get(penId)
+  const original = JSON.stringify(room.manifest)
+  const source = await engine._source(srcKey)
+  let configReads = 0
+  const checkout = source.checkout.bind(source)
+  source.checkout = (...args) => {
+    const view = checkout(...args)
+    const entry = view.entry.bind(view)
+    view.entry = (name, options) => {
+      if (name === '/pear.json') configReads++
+      return entry(name, options)
+    }
+    return view
+  }
+  for (const config of [
+    null,
+    '{',
+    JSON.stringify({
+      multisig: { namespace: namespace + '/different', publicKeys, quorum: 1 }
+    })
+  ]) {
+    if (config !== null) await source.put('/pear.json', Buffer.from(config))
+    const { output } = await engine.command('manual.request', { penId, srcKey })
+    const request = SigningRequest.decode(z32.decode(output))
+    assert.equal(z32.encode(Hypercore.key(request.manifest)), penId)
+    assert.equal(JSON.stringify(room.manifest), original)
+    assert.equal(room.target.core.length, 0)
+  }
+  assert.equal(configReads, 0)
+})
+
+test('unavailable source configuration blocks time out without initializing the target', async (t) => {
+  const { engine, pairs, srcKey } = await fixture(t)
+  const publicKeys = pairs.map((pair) => z32.encode(pair.publicKey))
+  const namespace = 'test/unavailable-config-blocks'
+  const penId = z32.encode(Hypercore.key(manifestFor(publicKeys, namespace, 2)))
+  await engine.command('pen.add', { multisigKey: penId })
+  const source = await engine._source(srcKey)
+  await source.put(
+    '/pear.json',
+    Buffer.from(
+      JSON.stringify({ multisig: { namespace, publicKeys, quorum: 2 } })
+    )
+  )
+  await source.clear('/pear.json')
+  engine.timeout = 80
+  const start = Date.now()
+  await assert.rejects(engine.command('request.create', { penId, srcKey }))
+  assert.ok(Date.now() - start < 1000)
+  const room = engine.rooms.get(penId)
+  assert.equal(room.target.core.manifest, null)
+  assert.equal(room.target.core.length, 0)
+  assert.equal(room.events.length, 0)
+})
+
+test('versioned requests use their exact source prefix and keep legacy peer event keys', async (t) => {
+  const { engine, pairs, penId, srcKey } = await fixture(t)
+  const source = await engine._source(srcKey)
+  const length = source.core.length
+  const fork = source.core.fork
+  const link = `pear://${fork}.${length}.${srcKey}`
+  await source.put(
+    '/app.js',
+    Buffer.from('changed after the requested version')
+  )
+  await source.put('/later.txt', Buffer.from('later'))
+  const latest = source.core.length
+  await engine.command('request.create', { penId, srcKey: link })
+  const current = engine.snapshot().pens[0].request
+  const request = SigningRequest.decode(z32.decode(current.request))
+  assert.equal(request.length, length)
+  assert.equal(request.fork, fork)
+  assert.equal(current.srcKey, link)
+  const event = engine.rooms
+    .get(penId)
+    .events.find((item) => item.id === current.id)
+  assert.equal(event.data.srcKey, srcKey)
+  assert.equal(event.data.authorName, 'Alice')
+  const result = await engine.command('manual.commit', {
+    penId,
+    request: current.request,
+    srcKey: link,
+    responses: pairs.slice(0, 2).map((pair) => sign(current.request, pair)),
+    confirmation: 'COMMIT'
+  })
+  assert.equal(result.length, length)
+  assert.equal(result.srcKey, link)
+  const target = engine.rooms.get(penId).target
+  assert.equal((await target.get('/app.js')).toString(), 'hello')
+  assert.equal(await target.entry('/later.txt'), null)
+  await engine.command('request.create', { penId, srcKey })
+  assert.equal(
+    engine.snapshot().pens[0].request.srcKey,
+    `pear://${fork}.${latest}.${srcKey}`
+  )
+  assert.equal(engine.snapshot().pens[0].request.length, latest)
+})
+
+test('unavailable source versions, mismatched review pins and target aliases never fall back to latest', async (t) => {
+  const { engine, pairs, penId, srcKey } = await fixture(t)
+  await engine.command('request.create', { penId, srcKey })
+  const current = engine.snapshot().pens[0].request
+  const req = SigningRequest.decode(z32.decode(current.request))
+  const room = engine.rooms.get(penId)
+  const count = room.events.length
+  for (const link of [
+    `pear://${req.fork + 1}.${req.length}.${srcKey}`,
+    `pear://${req.fork}.${req.length + 100}.${srcKey}`,
+    `pear://${req.fork}.0.${srcKey}`,
+    `pear://${req.fork}.${req.length}.${penId}`
+  ]) {
+    await assert.rejects(
+      engine.command('request.create', { penId, srcKey: link })
+    )
+  }
+  for (const link of [
+    `pear://${req.fork}.${req.length + 1}.${srcKey}`,
+    `pear://${req.fork + 1}.${req.length}.${srcKey}`
+  ]) {
+    for (const method of ['manual.review', 'manual.commit']) {
+      await assert.rejects(
+        engine.command(method, {
+          penId,
+          request: current.request,
+          srcKey: link,
+          responses: pairs
+            .slice(0, 2)
+            .map((pair) => sign(current.request, pair)),
+          confirmation: 'COMMIT'
+        }),
+        /Source version does not match/
+      )
+    }
+  }
+  assert.equal(room.events.length, count)
+  assert.equal(room.target.core.length, 0)
+  assert.equal(room.contentCore.length, 0)
+})
+
+test('automatic configuration comes from the selected source version, never a newer recipe', async (t) => {
+  const { engine, pairs, srcKey } = await fixture(t)
+  const publicKeys = pairs.map((pair) => z32.encode(pair.publicKey))
+  const firstNamespace = 'test/versioned-first-configuration'
+  const secondNamespace = 'test/versioned-second-configuration'
+  const firstKey = z32.encode(
+    Hypercore.key(manifestFor(publicKeys, firstNamespace, 2))
+  )
+  const secondKey = z32.encode(
+    Hypercore.key(manifestFor(publicKeys, secondNamespace, 2))
+  )
+  const source = await engine._source(srcKey)
+  await source.put(
+    '/pear.json',
+    Buffer.from(
+      JSON.stringify({
+        multisig: { namespace: firstNamespace, publicKeys, quorum: 2 }
+      })
+    )
+  )
+  const length = source.core.length
+  const link = `pear://${source.core.fork}.${length}.${srcKey}`
+  await source.put(
+    '/pear.json',
+    Buffer.from(
+      JSON.stringify({
+        multisig: { namespace: secondNamespace, publicKeys, quorum: 2 }
+      })
+    )
+  )
+  await engine.command('pen.add', { multisigKey: firstKey })
+  await engine.command('pen.add', { multisigKey: secondKey })
+  await assert.rejects(
+    engine.command('request.create', { penId: secondKey, srcKey: link }),
+    /does not match/
+  )
+  assert.equal(engine.rooms.get(secondKey).target.core.manifest, null)
+  const manual = await engine.command('manual.request', {
+    penId: firstKey,
+    multisigKey: firstKey,
+    srcKey,
+    length
+  })
+  const pinned = await engine.command('manual.request', {
+    penId: firstKey,
+    srcKey: link
+  })
+  assert.equal(manual.output, pinned.output)
+  const current = engine
+    .snapshot()
+    .pens.find((pen) => pen.id === firstKey).request
+  assert.equal(current.srcKey, link)
+  assert.equal(current.length, length)
+  assert.equal(engine.rooms.get(firstKey).target.core.length, 0)
+})
+
+test('review of a cold historical prefix fetches only its necessary proof leaf', async (t) => {
+  const {
+    engine: alice,
+    pairs,
+    penId,
+    srcKey
+  } = await fixture(t, 1, { swarm: new LocalSwarm() })
+  const source = await alice._source(srcKey)
+  await source.put('/second.txt', Buffer.from('two'))
+  await source.put('/third.txt', Buffer.from('three'))
+  const { output: request } = await alice.command('manual.request', {
+    penId,
+    srcKey
+  })
+  const req = SigningRequest.decode(z32.decode(request))
+  await source.put('/fourth.txt', Buffer.from('four'))
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'pear-pen-historical-review-')
+  )
+  const bob = new PearPen({
+    dir,
+    network: false,
+    swarm: new LocalSwarm(),
+    timeout: 3000
+  })
+  t.after(async () => {
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  await bob.command('profile.import', keyInput(pairs[0]))
+  await bob.command('pen.add', { multisigKey: penId })
+  await bob.command('pen.configure', {
+    penId,
+    config: JSON.stringify({
+      multisig: {
+        namespace: 'test/pear-pen',
+        publicKeys: [z32.encode(pairs[0].publicKey)],
+        quorum: 1
+      }
+    })
+  })
+  await connectLocal(t, alice, bob)
+  const remote = await bob._source(srcKey)
+  await bob._update(remote.blobs.core)
+  assert.equal(remote.blobs.core.length, 4)
+  await assert.rejects(
+    Hypercore.treeHashFromStorage(remote.blobs.core, req.content.length),
+    { code: 'INVALID_OPERATION' }
+  )
+  const downloaded = []
+  remote.blobs.core.on('download', (index) => downloaded.push(index))
+  remote.blobs.core.download = () => {
+    throw new Error('Historical review must not download a body range')
+  }
+  const result = await bob.command('manual.review', {
+    penId,
+    request,
+    srcKey: `pear://${req.fork}.${req.length}.${srcKey}`
+  })
+  assert.equal(result.files.length, 3)
+  assert.deepEqual(downloaded, [req.content.length - 1])
+  assert.equal(await remote.blobs.core.has(0), false)
+  assert.equal(bob.rooms.get(penId).target.core.length, 0)
+})
+
+test('removing and readding a pen closes unmatched channels on a live connection', async (t) => {
+  const {
+    engine: alice,
+    pairs,
+    penId
+  } = await fixture(t, 2, {
+    swarm: new LocalSwarm()
+  })
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pear-pen-channel-readd-'))
+  const bob = new PearPen({ dir, network: false, swarm: new LocalSwarm() })
+  await bob.command('profile.import', keyInput(pairs[1]))
+  const left = new SecretStream(true)
+  const right = new SecretStream(false)
+  left.on('error', () => {})
+  right.on('error', () => {})
+  left.rawStream.pipe(right.rawStream).pipe(left.rawStream)
+  await Promise.all([left.opened, right.opened])
+  alice.swarm.connections.add(left)
+  bob.swarm.connections.add(right)
+  alice._connection(left)
+  bob._connection(right)
+  t.after(async () => {
+    left.destroy()
+    right.destroy()
+    await bob.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  const oldRoom = alice.rooms.get(penId)
+  const oldChannel = [...alice.channels.values()][0]
+  assert.equal(oldRoom.channels.size, 0)
+  assert.equal(alice.channels.size, 1)
+  await alice.command('pen.remove', { penId })
+  assert.equal(oldChannel.closed, true)
+  assert.equal(alice.channels.size, 0)
+  await alice.command('pen.add', { multisigKey: penId })
+  const newChannel = [...alice.channels.values()][0]
+  assert.notEqual(newChannel, oldChannel)
+  oldChannel.onclose()
+  assert.equal([...alice.channels.values()][0], newChannel)
+  await bob.command('pen.add', { multisigKey: penId })
+  await until(
+    () =>
+      alice.snapshot().pens[0].peers === 1 && bob.snapshot().pens[0].peers === 1
+  )
+  assert.equal(oldRoom.channels.size, 0)
+})
 
 test(
   'offline quorum survives restart and later mismatch never lowers the actual signing quorum',
@@ -966,7 +2797,11 @@ test(
       responses: [],
       confirmation: 'COMMIT'
     })
-    await until(() => alice.snapshot().pens[0].request === null)
+    await until(
+      () =>
+        alice.snapshot().pens[0].request === null &&
+        alice.snapshot().pens[0].activity.some((item) => item.type === 'commit')
+    )
     assert.ok(
       alice.snapshot().pens[0].activity.some((item) => item.type === 'commit')
     )
@@ -1108,6 +2943,21 @@ test('relayed signatures retain their signers and never automatically carry into
   await engine.command('request.create', { penId, srcKey: otherKey })
   const second = engine.snapshot().pens[0].request.request
   assert.deepEqual(engine.snapshot().pens[0].request.signatures, [])
+  const before = engine.snapshot()
+  const verification = {
+    penId,
+    response: bob,
+    request: first,
+    publicKey: z32.encode(pairs[1].publicKey)
+  }
+  assert.equal(
+    (await engine.command('manual.verify', verification)).verified,
+    true
+  )
+  await assert.rejects(
+    engine.command('manual.verify', { ...verification, request: second })
+  )
+  assert.deepEqual(engine.snapshot(), before)
   await assert.rejects(
     engine.command('manual.review', {
       penId,
@@ -1166,28 +3016,20 @@ test('a manual commit observation waits for matching metadata and content proof'
       c.decode(CoreSign.messages.Response, z32.decode(response)).signatures
   )
   const source = await engine._source(srcKey)
-  const metadata = await createUpdateBatch(room.target.core, source.core, {
-    end: req.length
-  })
-  await commitUpdateBatch(
+  await signCore(
     room.target.core,
-    metadata,
+    source.core,
     signatures.map((value) => value[0]),
-    { length: req.length }
+    { length: req.length, commit: true }
   )
-  await metadata.close()
   await engine.queue
   assert.equal(engine.snapshot().pens[0].request.id, requestId)
-  const content = await createUpdateBatch(room.contentCore, source.blobs.core, {
-    end: req.content.length
-  })
-  await commitUpdateBatch(
+  await signCore(
     room.contentCore,
-    content,
+    source.blobs.core,
     signatures.map((value) => value[1]),
-    { length: req.content.length }
+    { length: req.content.length, commit: true }
   )
-  await content.close()
   await until(() => engine.snapshot().pens[0].request === null)
   assert.ok(
     engine
@@ -1242,7 +3084,10 @@ test('late committed or wrong-fork requests cannot supersede an active request',
   })
   assert.equal(copied.output, current.request)
   assert.notEqual(engine.snapshot().pens[0].request.id, current.id)
-  assert.equal(engine.snapshot().pens[0].request.srcKey, cloneKey)
+  assert.equal(
+    engine.snapshot().pens[0].request.srcKey,
+    `pear://${room.current.req.fork}.${room.current.req.length}.${cloneKey}`
+  )
 })
 
 test('a different manual commit closes a stale automatic request without inventing its creator', async (t) => {
@@ -1350,7 +3195,11 @@ test(
       requestId,
       confirmation: 'COMMIT'
     })
-    await until(() => bob.snapshot().pens[0].request === null)
+    await until(
+      () =>
+        bob.snapshot().pens[0].request === null &&
+        bob.snapshot().pens[0].activity.some((item) => item.type === 'commit')
+    )
     assert.equal(alice.snapshot().pens[0].request, null)
     assert.ok(
       bob.snapshot().pens[0].activity.some((event) => event.type === 'commit')
@@ -1434,6 +3283,11 @@ test(
     let holdManifest = true
     bob._manifest = async (room, required) => {
       if (!holdManifest || required) return loadManifest(room, required)
+    }
+    const receive = bob._receive.bind(bob)
+    bob._receive = async (room, event) => {
+      if (holdManifest && !room.manifest) return bob._buffer(room, event)
+      return receive(room, event)
     }
     const left = new SecretStream(true)
     const right = new SecretStream(false)

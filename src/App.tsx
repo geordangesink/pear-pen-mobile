@@ -11,11 +11,20 @@ import {
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context'
 import { reloadAppAsync } from 'expo-modules-core'
 import { StatusBar } from 'expo-status-bar'
-import { call, client, errorMessage, type Pen, type SavedDialog } from './client'
+import {
+  call,
+  client,
+  errorMessage,
+  verifySignature,
+  type Pen,
+  type SavedDialog,
+  type SignatureVerification
+} from './client'
 import { clearKeyExports } from './key-files'
 import Onboarding from './Onboarding'
 import Detail from './PenDetail'
 import PenList from './PenList'
+import PenAvatar from './PenAvatar'
 import DialogView, { saveOutput, type Dialog } from './Dialogs'
 import { dark, light, Icon } from './ui'
 import { styles } from './styles'
@@ -32,14 +41,21 @@ function PearPen() {
   const system = useColorScheme()
   const [data, setData] = useState(client.read())
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [dialog, setDialog] = useState<Dialog | null>(null)
+  const [openDialog, setDialog] = useState<Dialog | null>(null)
   const [toast, setToast] = useState('')
+  const [creatingIdentity, setCreatingIdentity] = useState(false)
+  const [verifyingId, setVerifyingId] = useState<string | null>(null)
+  const verification = useRef<Promise<string> | null>(null)
   const applying = useRef(false)
   const shownDialog = useRef<SavedDialog | null>(null)
   const { state, update, failure, warning } = data
   const theme = state?.settings.theme || 'system'
   const colors = (theme === 'system' ? system : theme) === 'dark' ? dark : light
-  const selected = state?.pens.find((pen) => pen.id === selectedId)
+  const manual = state?.settings.mode === 'manual'
+  const activePen = state?.pens.find((pen) => pen.id === selectedId)
+  const selected = manual ? undefined : activePen
+  const dialog: Dialog | null =
+    openDialog ?? (manual && activePen ? { kind: 'actions', penId: activePen.id } : null)
 
   useEffect(() => {
     const unsubscribe = client.subscribe(() => setData(client.read()))
@@ -72,6 +88,12 @@ function PearPen() {
     const timer = setTimeout(() => setToast(''), 2800)
     return () => clearTimeout(timer)
   }, [toast])
+  useEffect(() => {
+    setVerifyingId(null)
+    return () => {
+      verification.current = null
+    }
+  }, [selected?.id, openDialog])
 
   async function close() {
     if (dialog?.kind === 'output') {
@@ -82,6 +104,7 @@ function PearPen() {
         return
       }
     }
+    if (manual && dialog?.kind !== 'settings') setSelectedId(null)
     setDialog(null)
   }
   async function showOutput(text: string, title: string) {
@@ -99,16 +122,28 @@ function PearPen() {
       setToast(errorMessage(problem))
     }
   }
-  function openPen(pen: Pen) {
-    if (state?.settings.mode === 'manual') setDialog({ kind: 'actions', penId: pen.id })
-    else setSelectedId(pen.id)
+  async function verifyActivity(penId: string, entryId: string, signature: SignatureVerification) {
+    if (verification.current) return
+    const check = verifySignature(penId, signature)
+    verification.current = check
+    setVerifyingId(entryId)
+    try {
+      const text = await check
+      if (verification.current === check) await showOutput(text, 'Signature verified')
+    } catch (problem) {
+      if (verification.current === check) setToast(errorMessage(problem))
+    } finally {
+      if (verification.current === check) {
+        verification.current = null
+        setVerifyingId(null)
+      }
+    }
   }
   function openAutomatic(kind: 'request' | 'unlock' | 'review' | 'commit', pen: Pen) {
     setDialog({
       kind,
       penId: pen.id,
       automatic: true,
-      autoSubmit: kind === 'unlock' && !state?.profile?.encrypted,
       requestId: pen.request?.id,
       srcKey: pen.request?.srcKey
     })
@@ -133,8 +168,12 @@ function PearPen() {
       edges={['top', 'bottom']}
     >
       <StatusBar style={colors === dark ? 'light' : 'dark'} />
-      {!state.profile ? (
-        <Onboarding colors={colors} />
+      {!state.profile || creatingIdentity ? (
+        <Onboarding
+          colors={colors}
+          suggestedName={state.suggestedName || ''}
+          onSubmitting={setCreatingIdentity}
+        />
       ) : (
         <>
           <View style={styles.header}>
@@ -149,6 +188,7 @@ function PearPen() {
             ) : (
               <Image source={require('../assets/icon.png')} style={styles.brandIcon} />
             )}
+            {selected?.image && <PenAvatar image={selected.image} colors={colors} size={36} />}
             <View style={styles.headerTitle}>
               <Text numberOfLines={1} style={[styles.wordmark, { color: colors.ink }]}>
                 {selected?.name || 'Pear Pen'}
@@ -157,6 +197,17 @@ function PearPen() {
                 {selected ? `${selected.peers || 0} peers connected` : 'Multisig signing'}
               </Text>
             </View>
+            {selected && (
+              <Pressable
+                accessibilityRole='button'
+                accessibilityLabel='Pen details'
+                onPress={() => setDialog({ kind: 'details', penId: selected.id })}
+                hitSlop={4}
+                style={styles.iconButton}
+              >
+                <Icon name='information-circle-outline' color={colors.ink} />
+              </Pressable>
+            )}
             <Pressable
               accessibilityLabel='Settings'
               onPress={() => setDialog({ kind: 'settings' })}
@@ -174,6 +225,10 @@ function PearPen() {
               colors={colors}
               onRequest={() => openAutomatic('request', selected)}
               onSign={() => openAutomatic('unlock', selected)}
+              onVerify={(entryId, signature) =>
+                void verifyActivity(selected.id, entryId, signature)
+              }
+              verifyingId={verifyingId}
               onCopyResponse={(requestId) => void copyResponse(selected.id, requestId)}
               onOutput={(text, title) => void showOutput(text, title)}
               onReview={() => openAutomatic('review', selected)}
@@ -183,7 +238,8 @@ function PearPen() {
             <PenList
               state={state}
               colors={colors}
-              onOpen={openPen}
+              onOpen={(pen) => setSelectedId(pen.id)}
+              onDetails={(pen) => setDialog({ kind: 'details', penId: pen.id })}
               onAdd={() => setDialog({ kind: 'add' })}
             />
           )}
@@ -221,6 +277,14 @@ function PearPen() {
           onClose={() => void close()}
           onDialog={setDialog}
           onToast={setToast}
+          onSelectPen={(penId) => {
+            if (state.settings.mode === 'automatic') setSelectedId(penId)
+          }}
+          onPenRemoved={(penId) => {
+            setSelectedId((current) => (current === penId ? null : current))
+            setDialog(null)
+            setToast('Pen removed')
+          }}
         />
       )}
       {!!toast && (

@@ -43,6 +43,7 @@ export const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     gap: 14
   },
+  penOpen: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 14 },
   penAvatar: {
     height: 52,
     width: 52,
@@ -52,8 +53,6 @@ export const styles = StyleSheet.create({
   },
   penInfo: { flex: 1, gap: 5 },
   penTitle: { fontSize: 17, fontWeight: '500', letterSpacing: -0.3, flexShrink: 1 },
-  dot: { width: 6, height: 6, borderRadius: 3 },
-  tinyDot: { width: 5, height: 5, borderRadius: 3 },
   emptyScroll: { flexGrow: 1, justifyContent: 'center' },
   empty: { alignItems: 'center', gap: 13, marginTop: -35 },
   emptyMark: {
@@ -87,11 +86,9 @@ export const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth
   },
   pill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-    borderRadius: 15,
-    paddingHorizontal: 8,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 10,
     paddingVertical: 5
   },
   pillText: { fontSize: 9, fontWeight: '500' },
@@ -194,7 +191,7 @@ export const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 25
   },
-  onboardingHint: { fontSize: 11, textAlign: 'center', marginTop: 15 },
+  onboardingHint: { fontSize: 13, lineHeight: 19, marginVertical: 8 },
   importToggle: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -213,7 +210,7 @@ export const styles = StyleSheet.create({
     fontSize: 14,
     borderWidth: StyleSheet.hairlineWidth
   },
-  multiline: { minHeight: 84, textAlignVertical: 'top' },
+  multiline: { minHeight: 84, maxHeight: 160, textAlignVertical: 'top' },
   mono: { fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 12 },
   labelRow: {
     marginTop: 22,

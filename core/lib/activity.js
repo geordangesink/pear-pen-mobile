@@ -1,7 +1,21 @@
 const b4a = require('b4a')
 const z32 = require('z32')
 const protocol = require('./protocol')
-const { cleanEncoded, normalizeKey, requestHash } = protocol
+const { cleanEncoded, parseSource, normalizeSource, requestHash } = protocol
+
+function sourceLink(value, request, target) {
+  const source = parseSource(value)
+  if (source.key === target)
+    throw new Error('The source drive cannot be the multisig drive')
+  if (
+    source.fork !== null &&
+    (source.fork !== request.fork || source.length !== request.length)
+  )
+    throw new Error('Source version does not match the signing request')
+  return normalizeSource(
+    `pear://${request.fork}.${request.length}.${source.key}`
+  )
+}
 
 module.exports = async function rebuildActivity(
   room,
@@ -19,6 +33,13 @@ module.exports = async function rebuildActivity(
       clock = Math.max(clock, event.data.clock)
       return true
     })
+  const names = new Map()
+  for (const { data } of events) {
+    if (data.authorName === undefined) continue
+    const name = data.authorName.trim()
+    if (name) names.set(data.author, name)
+    else names.delete(data.author)
+  }
   const requests = new Map()
   const activity = []
   const byHash = new Map()
@@ -27,8 +48,7 @@ module.exports = async function rebuildActivity(
     try {
       const request = cleanEncoded(event.data.request)
       const req = parseRequest(request)
-      const srcKey = normalizeKey(event.data.srcKey)
-      if (srcKey === room.pen.multisigKey) continue
+      const srcKey = sourceLink(event.data.srcKey, req, room.pen.multisigKey)
       const hash = requestHash(request)
       const record = {
         id: event.id,
@@ -76,13 +96,15 @@ module.exports = async function rebuildActivity(
       const ctx = context(data, index)
       const entries = []
       if (data.type === 'response') {
+        const signer = data.signer ?? data.author
         const response = (
           await verifyResponses(ctx.request, [data.response])
-        ).get(data.author)
+        ).get(signer)
         if (!response) continue
-        entries.push([data.author, response.response])
+        entries.push([signer, response.response])
       } else {
-        if (data.srcKey !== undefined) normalizeKey(data.srcKey)
+        if (data.srcKey !== undefined)
+          sourceLink(data.srcKey, ctx.req, room.pen.multisigKey)
         const responses = await verifyResponses(
           ctx.request,
           data.responses || []
@@ -97,7 +119,9 @@ module.exports = async function rebuildActivity(
         request: ctx.request,
         requestHash: ctx.hash,
         requestId: ctx.record?.id || data.requestId,
-        ...(data.type !== 'response' && { sharedBy: data.author }),
+        ...((data.type !== 'response' || author !== data.author) && {
+          sharedBy: data.author
+        }),
         binding: ctx.record?.id || `orphan:${data.requestId || ctx.hash}`
       }))
       for (const item of verified)
@@ -224,6 +248,12 @@ module.exports = async function rebuildActivity(
   }
   if (current?.status === 'open' && (await destination(current)).committed)
     current.status = 'committed'
+  for (const item of activity) {
+    const authorName = names.get(item.author)
+    const sharedByName = names.get(item.sharedBy)
+    if (authorName) item.authorName = authorName
+    if (sharedByName) item.sharedByName = sharedByName
+  }
   return {
     clock,
     requests,
