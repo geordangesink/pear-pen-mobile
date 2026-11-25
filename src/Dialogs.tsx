@@ -623,7 +623,9 @@ export default function DialogView({
             {kind === 'actions' && (
               <>
                 <Text style={[styles.body, styles.actionsIntro, { color: colors.muted }]}>
-                  Choose an action.
+                  {pen?.request?.packageVersion
+                    ? `Current request · Version ${pen.request.packageVersion}`
+                    : 'Choose an action.'}
                 </Text>
                 {signingActions.map(([action, label, icon]) => (
                   <Pressable
@@ -670,7 +672,10 @@ export default function DialogView({
                   <Text style={[styles.body, { color: colors.muted }]}>
                     Connecting and loading source…
                   </Text>
-                  <Text selectable style={[styles.sourceKey, { color: colors.ink }]}>
+                  <Text
+                    selectable
+                    style={[styles.requestSource, styles.sourceKey, { color: colors.ink }]}
+                  >
                     {key.trim()}
                   </Text>
                 </View>

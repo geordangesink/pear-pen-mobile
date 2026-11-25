@@ -15,6 +15,7 @@ import { styles } from './styles'
 export type ManualAction = 'request' | 'sign' | 'response' | 'verify' | 'review' | 'commit'
 
 type RequestDetails = {
+  packageVersion?: string
   key: string
   fork: number
   length: number
@@ -24,6 +25,7 @@ type RequestDetails = {
 
 function describeRequest(details: RequestDetails) {
   return [
+    ...(details.packageVersion ? [`Version: ${details.packageVersion}`] : []),
     `Multisig key: ${details.key}`,
     `Fork: ${details.fork}`,
     `Metadata length: ${details.length}`,

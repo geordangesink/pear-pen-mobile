@@ -11,6 +11,7 @@ export type Activity = {
   author: string
   authorName?: string
   at: number
+  packageVersion?: string
   request?: string
   response?: string
   sharedBy?: string
@@ -20,6 +21,7 @@ export type SignatureVerification = { response: string; request: string; publicK
 export type SigningRequest = {
   id: string
   srcKey: string
+  packageVersion?: string
   request?: string
   creator: string
   signatures: string[]

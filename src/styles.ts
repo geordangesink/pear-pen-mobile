@@ -92,12 +92,11 @@ export const styles = StyleSheet.create({
     paddingVertical: 5
   },
   pillText: { fontSize: 9, fontWeight: '500' },
+  requestSource: { marginTop: 21, marginBottom: 20, gap: 7 },
   sourceKey: {
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     fontSize: 12,
-    lineHeight: 21,
-    marginTop: 21,
-    marginBottom: 20
+    lineHeight: 21
   },
   noRequest: { fontSize: 22, fontWeight: '400', letterSpacing: -0.6, marginVertical: 25 },
   quorumNote: { fontSize: 11, lineHeight: 17 },
@@ -127,6 +126,9 @@ export const styles = StyleSheet.create({
   activities: { paddingHorizontal: 23, paddingBottom: 25, gap: 16, flexGrow: 1 },
   activityRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 8, maxWidth: '94%' },
   activityMine: { alignSelf: 'flex-end' },
+  releaseDivider: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 5 },
+  releaseLine: { flex: 1, height: StyleSheet.hairlineWidth },
+  releaseLabel: { flexShrink: 1, fontSize: 12, fontWeight: '600', textAlign: 'center' },
   activityIcon: {
     width: 29,
     height: 29,

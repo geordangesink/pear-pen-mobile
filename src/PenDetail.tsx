@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { Fragment, useRef } from 'react'
 import { Pressable, ScrollView, Text, View } from 'react-native'
 import { knownQuorum, type Pen, type SignatureVerification, type State } from './client'
 import { Action, Icon, type Palette } from './ui'
@@ -83,9 +83,16 @@ export default function Detail({
           </View>
         </View>
         {request ? (
-          <Text selectable style={[styles.sourceKey, { color: colors.ink }]}>
-            {request.srcKey}
-          </Text>
+          <View style={styles.requestSource}>
+            {!!request.packageVersion && (
+              <Text selectable style={[styles.penTitle, { color: colors.ink }]}>
+                Version {request.packageVersion}
+              </Text>
+            )}
+            <Text selectable style={[styles.sourceKey, { color: colors.ink }]}>
+              {request.srcKey}
+            </Text>
+          </View>
         ) : (
           <Text style={[styles.noRequest, { color: colors.ink }]}>No open request</Text>
         )}
@@ -151,7 +158,7 @@ export default function Detail({
               entry.sharedBy === state.profile!.publicKey
                 ? state.profile!.name || 'You'
                 : entry.sharedByName || 'Signer'
-            return (
+            const message = (
               <View key={entry.id} style={[styles.activityRow, mine && styles.activityMine]}>
                 <View style={[styles.activityIcon, { backgroundColor: colors.soft }]}>
                   <Icon
@@ -228,6 +235,21 @@ export default function Detail({
                   )}
                 </View>
               </View>
+            )
+            if (entry.type !== 'commit') return message
+            return (
+              <Fragment key={entry.id}>
+                {message}
+                <View style={styles.releaseDivider}>
+                  <View style={[styles.releaseLine, { backgroundColor: colors.line }]} />
+                  <Text style={[styles.releaseLabel, { color: colors.success }]}>
+                    {entry.packageVersion
+                      ? `Released ${entry.packageVersion}`
+                      : 'Release committed'}
+                  </Text>
+                  <View style={[styles.releaseLine, { backgroundColor: colors.line }]} />
+                </View>
+              </Fragment>
             )
           })
         ) : (
