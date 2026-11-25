@@ -139,7 +139,7 @@ function PearPen() {
       }
     }
   }
-  function openAutomatic(kind: 'request' | 'unlock' | 'review' | 'commit', pen: Pen) {
+  function openAutomatic(kind: 'request' | 'unlock' | 'response' | 'review' | 'commit', pen: Pen) {
     setDialog({
       kind,
       penId: pen.id,
@@ -193,9 +193,18 @@ function PearPen() {
               <Text numberOfLines={1} style={[styles.wordmark, { color: colors.ink }]}>
                 {selected?.name || 'Pear Pen'}
               </Text>
-              <Text style={[styles.small, { color: colors.muted }]}>
-                {selected ? `${selected.peers || 0} peers connected` : 'Multisig signing'}
-              </Text>
+              {selected && !selected.privateRoom ? (
+                <Pressable
+                  accessibilityRole='button'
+                  onPress={() => setDialog({ kind: 'add', penId: selected.id })}
+                >
+                  <Text style={[styles.small, { color: colors.success }]}>Set up private room</Text>
+                </Pressable>
+              ) : (
+                <Text style={[styles.small, { color: colors.muted }]}>
+                  {selected ? `${selected.peers || 0} peers connected` : 'Multisig signing'}
+                </Text>
+              )}
             </View>
             {selected && (
               <Pressable
@@ -230,6 +239,7 @@ function PearPen() {
               }
               verifyingId={verifyingId}
               onCopyResponse={(requestId) => void copyResponse(selected.id, requestId)}
+              onSubmitResponse={() => openAutomatic('response', selected)}
               onOutput={(text, title) => void showOutput(text, title)}
               onReview={() => openAutomatic('review', selected)}
               onCommit={() => openAutomatic('commit', selected)}
@@ -277,9 +287,7 @@ function PearPen() {
           onClose={() => void close()}
           onDialog={setDialog}
           onToast={setToast}
-          onSelectPen={(penId) => {
-            if (state.settings.mode === 'automatic') setSelectedId(penId)
-          }}
+          onSelectPen={setSelectedId}
           onPenRemoved={(penId) => {
             setSelectedId((current) => (current === penId ? null : current))
             setDialog(null)

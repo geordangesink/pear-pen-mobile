@@ -147,6 +147,42 @@ export function Field({
   )
 }
 
+export function KeyCredentials({
+  username,
+  password,
+  onChange,
+  colors,
+  busy
+}: {
+  username: string
+  password: string
+  onChange: (value: string) => void
+  colors: Palette
+  busy: boolean
+}) {
+  return (
+    <>
+      <Field
+        label='USERNAME'
+        value={username}
+        colors={colors}
+        autoComplete='username'
+        editable={false}
+      />
+      <Field
+        label='KEY PASSWORD'
+        value={password}
+        onChange={onChange}
+        colors={colors}
+        placeholder='Enter your key password'
+        autoComplete='current-password'
+        editable={!busy}
+        secure
+      />
+    </>
+  )
+}
+
 export function Segments({
   items,
   value,

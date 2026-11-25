@@ -9,7 +9,7 @@
   "license": "Apache-2.0",
   "scripts": {
     "start": "expo start",
-    "bundle:bare": "bare-pack --host ios-arm64 --host ios-arm64-simulator --host ios-x64-simulator --host android-arm64 --linked --out ./src/worker.bundle.js ./workers/main.js",
+    "bundle:bare": "bare-pack --host ios-arm64 --host ios-arm64-simulator --host ios-x64-simulator --host android-arm64 --linked --out ./src/worker.bundle.js ./node_modules/pear-pen-core/worker.js",
     "bundle:react-native": "react-native bundle --platform ios --dev false --entry-file index.ts --bundle-output out/ios/PearPen/app.bundle --assets-dest out/ios/PearPen && react-native bundle --platform android --dev false --entry-file index.ts --bundle-output out/android/PearPen/app.bundle --assets-dest out/android/PearPen",
     "build": "node scripts/check-upgrade.js && pear-build --ios-arm64 ./out/ios/PearPen --ios-arm64-simulator ./out/ios/PearPen --ios-x64-simulator ./out/ios/PearPen --android-arm64 ./out/android/PearPen --package ./package.json --config ./pear.json --target dist",
     "update": "node scripts/check-upgrade.js && npm run bundle:bare && npm run bundle:react-native && npm run build",
@@ -24,7 +24,7 @@
     "lint": "prettier --check .",
     "format": "prettier --write .",
     "test": "npm run typecheck && npm run lint && npm run test:core",
-    "test:core": "node --test core/test/*.test.js"
+    "test:core": "npm --prefix node_modules/pear-pen-core test"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.1.1",
@@ -41,12 +41,11 @@
     "expo-sharing": "~55.0.25",
     "expo-status-bar": "~55.0.4",
     "expo-system-ui": "~55.0.10",
-    "framed-stream": "^1.0.1",
     "hyper-multisig": "2.5.0",
     "hypercore-sign-v4": "npm:hypercore-sign@4.1.1",
     "hypercore-signing-request": "5.2.0",
     "pear-mobile": "^4.3.0",
-    "pear-pen-core": "file:core",
+    "pear-pen-core": "file:vendor/pear-pen-core-1.0.0-9724c07b7939.tgz",
     "pear-runtime": "^1.3.1",
     "pear-runtime-react-native": "^3.0.1",
     "react": "19.2.0",

@@ -1,10 +1,10 @@
-import PearRuntime from 'pear-mobile'
-import FramedStream from 'framed-stream'
+import PearPenCore from 'pear-pen-core'
 import b4a from 'b4a'
 import bundle from './worker.bundle.js'
 import { version, upgrade, productName } from '../package.json'
 
 export type Activity = {
+  localOnly?: boolean
   id: string
   type: string
   text: string
@@ -27,6 +27,7 @@ export type SigningRequest = {
   status: string
 }
 export type Pen = {
+  privateRoom: boolean
   id: string
   name: string
   image?: string | null
@@ -45,7 +46,20 @@ export function knownQuorum(pen: Pen) {
   return pen.request?.quorum || pen.quorum
 }
 
-export type SavedDialog = { kind: 'output'; title: string; text: string; details?: string }
+export type ManualRelease = {
+  penId: string
+  multisigKey: string
+  requestId?: string
+  request?: string
+  srcKey?: string
+  responses?: string[]
+}
+export type OutputOptions = { details?: string; manualCommit?: ManualRelease }
+export type SavedDialog = OutputOptions & {
+  kind: 'output'
+  title: string
+  text: string
+}
 export type State = {
   profile: null | { name: string; username?: string; publicKey: string; encrypted: boolean }
   suggestedName: string | null
@@ -65,7 +79,7 @@ const pending = new Map<
   }
 >()
 let serial = 0
-let pipe: FramedStream | null = null
+let pipe: PearPenCore | null = null
 let state: State | null = null
 let update: Update = { status: '' }
 let failure = ''
@@ -86,13 +100,7 @@ function takeRequest(id: number) {
 
 function start() {
   if (pipe) return
-  const ipc = PearRuntime.run('/worker.bundle', bundle, [
-    String(!__DEV__),
-    version,
-    upgrade,
-    productName
-  ])
-  pipe = new FramedStream(ipc)
+  pipe = new PearPenCore({ bundle, updates: !__DEV__, version, upgrade, name: productName })
   pipe.on('data', (bytes) => {
     try {
       const message = JSON.parse(b4a.toString(bytes))

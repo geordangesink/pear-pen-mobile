@@ -17,6 +17,7 @@ export default function Detail({
   onReview,
   onCommit,
   onCopyResponse,
+  onSubmitResponse,
   onOutput
 }: {
   pen: Pen
@@ -29,6 +30,7 @@ export default function Detail({
   onReview: () => void
   onCommit: () => void
   onCopyResponse: (requestId: string) => void
+  onSubmitResponse: () => void
   onOutput: (text: string, title: string) => void
 }) {
   const scroll = useRef<ScrollView>(null)
@@ -194,6 +196,11 @@ export default function Detail({
                   <Text selectable style={[styles.activityText, { color: colors.ink }]}>
                     {entry.text}
                   </Text>
+                  {entry.localOnly && (
+                    <Text style={[styles.activityAuthor, { color: colors.muted }]}>
+                      Earlier · only on this device
+                    </Text>
+                  )}
                   {entry.sharedBy && entry.sharedBy !== entry.author && (
                     <Text style={[styles.activityAuthor, { color: colors.muted }]}>
                       Shared by {sharedByName} · {shortKey(entry.sharedBy)}
@@ -244,10 +251,20 @@ export default function Detail({
               </View>
             )}
           </View>
+        ) : request && signed ? (
+          <View>
+            <Action
+              title='Copy response'
+              onPress={() => onCopyResponse(request.id)}
+              colors={colors}
+              secondary
+            />
+            <Action title='Submit peer’s response' onPress={onSubmitResponse} colors={colors} />
+          </View>
         ) : (
           <Action
-            title={!request ? 'New request' : signed ? 'Copy response' : 'Sign request'}
-            onPress={!request ? onRequest : signed ? () => onCopyResponse(request.id) : onSign}
+            title={request ? 'Sign request' : 'New request'}
+            onPress={request ? onSign : onRequest}
             colors={colors}
           />
         )}

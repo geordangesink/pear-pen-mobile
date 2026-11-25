@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { Keyboard, Pressable, Text } from 'react-native'
-import { call, errorMessage, verifySignature, type Pen, type State } from './client'
-import { Action, Field, type Palette } from './ui'
+import {
+  call,
+  errorMessage,
+  verifySignature,
+  type ManualRelease,
+  type OutputOptions,
+  type Pen,
+  type State
+} from './client'
+import { Action, Field, KeyCredentials, type Palette } from './ui'
 import { styles } from './styles'
 
 export type ManualAction = 'request' | 'sign' | 'response' | 'verify' | 'review' | 'commit'
@@ -30,6 +38,7 @@ export default function ManualSigning({
   pen,
   profile,
   requestId,
+  manualCommit,
   colors,
   busy,
   setBusy,
@@ -40,11 +49,12 @@ export default function ManualSigning({
   pen: Pen
   profile: NonNullable<State['profile']>
   requestId?: string
+  manualCommit?: ManualRelease
   colors: Palette
   busy: boolean
   setBusy: (busy: boolean) => void
   onBack: () => void
-  onOutput: (value: unknown, title: string, details?: string) => Promise<void>
+  onOutput: (value: unknown, title: string, options?: OutputOptions) => Promise<void>
 }) {
   const [step, setStep] = useState(0)
   const [destination, setDestination] = useState(`pear://${pen.multisigKey}`)
@@ -62,9 +72,9 @@ export default function ManualSigning({
   const mounted = useRef(false)
   const release = method === 'review' || method === 'commit'
   const current = requestId && pen.request?.id === requestId ? pen.request : null
-  const enteringDestination = step === 0 && (release || method === 'request')
+  const enteringDestination = !manualCommit && step === 0 && (release || method === 'request')
   const enteringPasted = release && pasted && step === 1
-  const confirmingCommit = method === 'commit' && step === (pasted ? 2 : 1)
+  const confirmingCommit = method === 'commit' && (!!manualCommit || step === (pasted ? 2 : 1))
 
   function move(next: number) {
     setError('')
@@ -153,7 +163,7 @@ export default function ManualSigning({
         srcKey: source.trim(),
         length: Number(length)
       })
-      await onOutput(result.output, 'Signing request', describeRequest(result.details))
+      await onOutput(result.output, 'Signing request', { details: describeRequest(result.details) })
     }
   } else if (method === 'response' || (method === 'verify' && step === 0)) {
     input = (
@@ -171,6 +181,7 @@ export default function ManualSigning({
       run = async () => {
         const result = await call('manual.submitResponse', {
           penId: pen.id,
+          requestId,
           response: responses.trim()
         })
         await onOutput(result, 'Response submitted')
@@ -243,25 +254,13 @@ export default function ManualSigning({
       label = profile.encrypted ? 'Confirm signing key' : 'Confirm key and sign'
     } else {
       input = (
-        <>
-          <Field
-            colors={colors}
-            label='USERNAME'
-            value={profile.username || profile.name}
-            autoComplete='username'
-            editable={false}
-          />
-          <Field
-            colors={colors}
-            label='PASSWORD'
-            value={password}
-            onChange={setPassword}
-            placeholder='Enter your key password'
-            autoComplete='current-password'
-            secure
-            editable={!busy}
-          />
-        </>
+        <KeyCredentials
+          username={profile.username || profile.name || profile.publicKey}
+          password={password}
+          onChange={setPassword}
+          colors={colors}
+          busy={busy}
+        />
       )
       label = 'Sign request'
       disabled = !password
@@ -309,40 +308,45 @@ export default function ManualSigning({
       <>
         <Text style={note}>This publishes the signed changes to the multisig drive.</Text>
         <Text selectable style={reading}>
-          {pasted ? source : current?.srcKey}
+          {manualCommit?.srcKey ||
+            (pasted ? source : current?.srcKey) ||
+            'The current request changed. Reopen Review to use it.'}
         </Text>
         <Field
           {...field}
-          label='TYPE CONFIRM TO COMMIT'
+          label='TYPE COMMIT TO PUBLISH'
           value={confirmation}
           onChange={setConfirmation}
-          placeholder='CONFIRM'
+          placeholder='COMMIT'
         />
       </>
     )
-    disabled = confirmation !== 'CONFIRM' || (!pasted && !current)
+    disabled = confirmation !== 'COMMIT' || (!manualCommit?.request && !pasted && !current)
   }
 
   if ((method === 'review' && (!pasted || enteringPasted)) || confirmingCommit) {
     label = method === 'review' ? 'Review changes' : 'Commit changes'
     run = async () => {
-      const params = pasted
-        ? {
-            request: request.trim(),
-            srcKey: source.trim(),
-            responses: responses
-              .trim()
-              .split(/[\s,]+/)
-              .filter(Boolean)
-          }
-        : { requestId }
-      const result = await call(`manual.${method}`, {
+      const params = manualCommit ?? {
         penId: pen.id,
         multisigKey: destination.trim(),
+        ...(pasted
+          ? {
+              request: request.trim(),
+              srcKey: source.trim(),
+              responses: responses
+                .trim()
+                .split(/[\s,]+/)
+                .filter(Boolean)
+            }
+          : { requestId })
+      }
+      const result = await call(`manual.${method}`, {
         ...params,
         ...(confirmingCommit && { confirmation })
       })
-      await onOutput(result, method === 'review' ? 'Review' : 'Commit complete')
+      if (method === 'review') await onOutput(result, 'Review', { manualCommit: params })
+      else await onOutput(result, 'Commit complete')
     }
   }
 

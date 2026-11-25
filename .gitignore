@@ -8,6 +8,7 @@ src/worker.bundle.js
 out/
 dist/
 *.tgz
+!vendor/pear-pen-core-*.tgz
 *.jks
 *.keystore
 *.p12

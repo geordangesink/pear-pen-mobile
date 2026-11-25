@@ -5,4 +5,4 @@ ios
 android
 modules
 src/worker.bundle.js
-core
+vendor

@@ -74,7 +74,7 @@ export default function PenList({
             </View>
             <Text style={[styles.emptyTitle, { color: colors.ink }]}>No pens yet</Text>
             <Text style={[styles.body, styles.centerText, { color: colors.muted }]}>
-              Add a multisig drive to start signing.
+              Create or join a private signing room.
             </Text>
           </View>
         )}

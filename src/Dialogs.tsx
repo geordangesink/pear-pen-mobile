@@ -13,37 +13,45 @@ import {
   View
 } from 'react-native'
 import * as Clipboard from 'expo-clipboard'
-import { call, errorMessage, knownQuorum, type SavedDialog, type State } from './client'
+import {
+  call,
+  errorMessage,
+  knownQuorum,
+  type OutputOptions,
+  type SavedDialog,
+  type State
+} from './client'
 import KeyExport from './KeyExport'
 import ManualSigning, { type ManualAction } from './ManualSigning'
 import Configuration from './Configuration'
 import PenAvatar from './PenAvatar'
 import { choosePenImage } from './pen-images'
-import { Action, Field, Icon, Segments, type Palette } from './ui'
+import { Action, Field, Icon, KeyCredentials, Segments, type Palette } from './ui'
 import { styles } from './styles'
 import { version } from '../package.json'
 
-export type Dialog = {
+export type Dialog = OutputOptions & {
   kind:
     | 'add'
     | 'settings'
     | 'actions'
     | 'details'
     | 'configuration'
+    | 'join'
+    | 'invite'
     | ManualAction
     | 'unlock'
     | 'output'
   title?: string
   name?: string
   text?: string
-  details?: string
   penId?: string
+  creating?: boolean
+  expiresAt?: number
   automatic?: boolean
   requestId?: string
   srcKey?: string
 }
-
-const help = 'https://docs.pears.com/pear/how-to/operate-an-app/multisig/set-up-multisig/'
 
 const signingActions = [
   ['details', 'Pen details', 'information-circle-outline'],
@@ -56,7 +64,7 @@ const signingActions = [
 ] as const
 
 const submitTitles: Partial<Record<Dialog['kind'], string>> = {
-  add: 'Add pen',
+  join: 'Join room',
   request: 'Create request',
   unlock: 'Sign request',
   review: 'Review changes',
@@ -66,7 +74,7 @@ const submitTitles: Partial<Record<Dialog['kind'], string>> = {
 export async function saveOutput(
   value: unknown,
   title: string,
-  details?: string
+  options?: OutputOptions
 ): Promise<SavedDialog> {
   let text: string
   if (typeof value === 'string') text = value
@@ -78,7 +86,7 @@ export async function saveOutput(
   )
     text = value.output
   else text = JSON.stringify(value, null, 2) ?? ''
-  const dialog: SavedDialog = { kind: 'output', title, text, ...(details && { details }) }
+  const dialog: SavedDialog = { kind: 'output', title, text, ...options }
   await call('dialog.save', { dialog })
   return dialog
 }
@@ -97,24 +105,26 @@ export default function DialogView({
   state: State
   colors: Palette
   onClose: () => void
-  onDialog: (dialog: Dialog) => void
+  onDialog: (dialog: Dialog | null) => void
   onToast: (text: string) => void
   onSelectPen: (penId: string) => void
   onPenRemoved: (penId: string) => void
 }) {
-  const pen = state.pens.find((item) => item.id === dialog.penId)
+  const pen = state.pens.find((item) => item.id === (dialog.penId ?? dialog.manualCommit?.penId))
   const quorum = pen ? knownQuorum(pen) : 0
   const kind = dialog.kind
   const manual =
-    !dialog.automatic &&
-    (kind === 'request' ||
-      kind === 'sign' ||
-      kind === 'response' ||
-      kind === 'verify' ||
-      kind === 'review' ||
-      kind === 'commit')
+    kind === 'response' ||
+    (!dialog.automatic &&
+      (kind === 'request' ||
+        kind === 'sign' ||
+        kind === 'verify' ||
+        kind === 'review' ||
+        kind === 'commit'))
   const [name, setName] = useState(
-    dialog.kind === 'settings' ? state.profile!.name : dialog.name || ''
+    dialog.kind === 'settings'
+      ? state.profile!.name
+      : (dialog.name ?? (pen && pen.name !== `pear://${pen.multisigKey}` ? pen.name : ''))
   )
   const [editing, setEditing] = useState(false)
   const [exportKind, setExportKind] = useState<'public' | 'private' | null>(null)
@@ -124,26 +134,31 @@ export default function DialogView({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
-  const needsPassword = kind === 'unlock' && state.profile?.encrypted
-  const username = state.profile?.username || state.profile?.name
-  const needsKey = kind === 'add' || kind === 'request'
+  const [confirmReview, setConfirmReview] = useState(false)
+  const reviewed = confirmReview && pen ? dialog.manualCommit : undefined
+  const manualAction = reviewed ? 'commit' : manual ? kind : undefined
+  const needsPassword = (kind === 'unlock' || kind === 'join') && state.profile?.encrypted
+  const needsKey = kind === 'join' || kind === 'request'
   const submitDisabled =
     (needsPassword && !password) ||
     (needsKey && !key.trim()) ||
     (kind === 'commit' && confirmation !== 'COMMIT')
   const submitTitle = !manual && submitTitles[kind]
   const title =
+    (reviewed ? 'Commit release' : '') ||
     (exportKind ? `Export ${exportKind} key` : '') ||
     dialog.title ||
     {
-      add: 'Add a pen',
+      add: pen ? 'Set up private room' : 'Add a pen',
+      join: 'Join private room',
+      invite: 'Invite a signer',
       settings: 'Settings',
       actions: pen?.name || 'Signing actions',
       details: 'Pen details',
       configuration: 'Configuration',
       request: 'New request',
       sign: 'Sign request',
-      response: 'Submit response',
+      response: dialog.automatic ? 'Submit peer’s response' : 'Submit response',
       verify: 'Verify signature',
       review: 'Review request',
       commit: 'Commit release',
@@ -151,19 +166,31 @@ export default function DialogView({
       output: 'Output'
     }[kind]
 
-  async function output(result: unknown, title: string, details?: string) {
-    onDialog(await saveOutput(result, title, details))
+  async function output(result: unknown, title: string, options?: OutputOptions) {
+    onDialog(await saveOutput(result, title, options))
   }
   async function submit() {
     setBusy(true)
     setError('')
     try {
-      if (kind === 'add') {
-        await call('pen.add', {
+      if (kind === 'join') {
+        const existing = new Set(
+          state.pens.filter((item) => item.privateRoom).map((item) => item.id)
+        )
+        const result: State = await call('pen.join', {
+          penId: pen?.id,
           name: name.trim(),
-          multisigKey: key.trim()
+          invite: key.trim(),
+          password
         })
-        onClose()
+        const joined =
+          pen?.id ?? result.pens.find((item) => item.privateRoom && !existing.has(item.id))?.id
+        setPassword('')
+        if (joined) {
+          onSelectPen(joined)
+          onDialog(null)
+        } else onClose()
+        onToast('Room joined')
       } else if (kind === 'settings') {
         await call('settings.update', { name: name.trim() })
         setEditing(false)
@@ -189,6 +216,20 @@ export default function DialogView({
           onToast('Request committed')
         }
       }
+    } catch (problem) {
+      setError(errorMessage(problem))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function inviteSigner() {
+    if (!pen || busy) return
+    setBusy(true)
+    setError('')
+    try {
+      const { invite, expiresAt } = await call('pen.invite', { penId: pen.id })
+      onDialog({ kind: 'invite', penId: pen.id, text: invite, expiresAt })
     } catch (problem) {
       setError(errorMessage(problem))
     } finally {
@@ -238,7 +279,9 @@ export default function DialogView({
     if (!pen || busy) return
     Alert.alert(
       'Remove pen from this device?',
-      `${pen.name}\n\nYou can add it again with its multisig link.`,
+      pen.privateRoom
+        ? `${pen.name}\n\nYou’ll need an invite from another member to rejoin this room.`
+        : pen.name,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -272,15 +315,21 @@ export default function DialogView({
     return (
       <Configuration
         pen={pen}
+        creating={!!dialog.creating}
+        profile={state.profile!}
         initialName={dialog.name}
         colors={colors}
         onClose={(name) =>
-          onDialog(pen ? { kind: 'details', penId: pen.id } : { kind: 'add', name })
+          onDialog(
+            dialog.creating
+              ? { kind: 'add', penId: pen?.id, name }
+              : { kind: 'details', penId: pen!.id }
+          )
         }
         onSaved={(penId) => {
-          if (!pen) onSelectPen(penId)
-          onToast(pen ? 'Configuration saved' : 'Pen added')
-          onDialog({ kind: 'details', penId })
+          if (dialog.creating) onSelectPen(penId)
+          onToast(dialog.creating ? 'Room created' : 'Configuration saved')
+          onDialog(dialog.creating ? null : { kind: 'details', penId })
         }}
       />
     )
@@ -318,25 +367,40 @@ export default function DialogView({
           >
             {kind === 'add' && (
               <>
-                <Segments
-                  items={['link', 'configuration']}
-                  value='link'
-                  onChange={(mode) => {
-                    if (!busy && mode === 'configuration') onDialog({ kind: 'configuration', name })
-                  }}
+                <Text style={[styles.body, { color: colors.muted }]}>
+                  {pen
+                    ? 'Create a room or join the one your signers use. Earlier activity stays on this device. The private room keeps its own history.'
+                    : 'Create a private room with your multisig configuration, or join another signer’s room.'}
+                </Text>
+                <Action
+                  title='Create room'
+                  onPress={() =>
+                    onDialog({ kind: 'configuration', creating: true, penId: pen?.id, name })
+                  }
                   colors={colors}
                 />
+                <Action
+                  title='Join with invite'
+                  onPress={() => onDialog({ kind: 'join', penId: pen?.id, name })}
+                  colors={colors}
+                  secondary
+                />
+              </>
+            )}
+            {kind === 'join' && (
+              <>
                 <Text style={[styles.body, { color: colors.muted }]}>
-                  Add an existing multisig drive.
+                  {busy ? 'Connecting to inviter…' : 'Paste an invite from a signer who is online.'}
                 </Text>
                 <Field
-                  label='MULTISIG DRIVE KEY'
+                  label='ROOM INVITE'
                   value={key}
                   onChange={setKey}
-                  placeholder='Paste a multisig key or pear:// link'
+                  placeholder='pear-pen://invite/…'
                   colors={colors}
                   mono
                   multiline
+                  editable={!busy}
                 />
                 <Field
                   label='PEN NAME · OPTIONAL'
@@ -344,18 +408,34 @@ export default function DialogView({
                   onChange={setName}
                   placeholder='Defaults to the drive link'
                   colors={colors}
+                  editable={!busy}
                 />
-                <Pressable onPress={() => void Linking.openURL(help)} style={styles.helpLink}>
-                  <Icon name='help-circle-outline' color={colors.success} size={17} />
-                  <Text style={[styles.small, { color: colors.success }]}>
-                    Where do I find this key? ↗
-                  </Text>
-                </Pressable>
-                <Text style={[styles.settingsHint, { color: colors.muted }]}>
-                  You can sign or review an existing request without adding a configuration. To
-                  create a request, Pear Pen can use /pear.json at the root of the source drive or
-                  the configuration in Pen details.
+              </>
+            )}
+            {kind === 'invite' && (
+              <>
+                <Text style={[styles.body, { color: colors.muted }]}>
+                  Keep Pear Pen online until they join. This 10-minute invite expires at{' '}
+                  {new Date(dialog.expiresAt!).toLocaleTimeString([], {
+                    hour: '2-digit',
+                    minute: '2-digit'
+                  })}
+                  .
                 </Text>
+                <Text
+                  style={[styles.reviewKey, { color: colors.ink, backgroundColor: colors.soft }]}
+                >
+                  {dialog.text}
+                </Text>
+                <Action
+                  title={copied ? 'Copied · Copy again' : 'Copy invite'}
+                  onPress={() => {
+                    if (Date.now() >= dialog.expiresAt!)
+                      setError('Invite expired. Create a new one in Pen details.')
+                    else void copy(dialog.text!, 'Invite copied')
+                  }}
+                  colors={colors}
+                />
               </>
             )}
             {kind === 'settings' && !exportKind && (
@@ -497,8 +577,8 @@ export default function DialogView({
                   pear://{pen.multisigKey}
                 </Text>
                 <Action
-                  title={copied ? 'Link copied' : 'Copy link'}
-                  onPress={() => void copy(`pear://${pen.multisigKey}`, 'Pen link copied')}
+                  title={copied ? 'Link copied' : 'Copy drive link'}
+                  onPress={() => void copy(`pear://${pen.multisigKey}`, 'Drive link copied')}
                   colors={colors}
                   secondary
                 />
@@ -508,18 +588,25 @@ export default function DialogView({
                     <Text style={[styles.body, { color: colors.muted }]}>{quorum}</Text>
                   </View>
                 )}
-                <View style={[styles.manualAction, { borderBottomColor: colors.line }]}>
-                  <Text style={[styles.manualText, { color: colors.ink }]}>Connected peers</Text>
-                  <Text style={[styles.body, { color: colors.muted }]}>{pen.peers}</Text>
-                </View>
+                {pen.privateRoom && (
+                  <View style={[styles.manualAction, { borderBottomColor: colors.line }]}>
+                    <Text style={[styles.manualText, { color: colors.ink }]}>Connected peers</Text>
+                    <Text style={[styles.body, { color: colors.muted }]}>{pen.peers}</Text>
+                  </View>
+                )}
                 {pen.quorumMismatch && (
                   <Text style={[styles.settingsHint, { color: colors.muted }]}>
                     Drive quorum is {pen.quorum} (entered {pen.configuredQuorum}).
                   </Text>
                 )}
-                <Text style={[styles.settingsHint, { color: colors.muted }]}>
-                  Read from the source automatically, or import its pear.json.
-                </Text>
+                <Action
+                  title={pen.privateRoom ? 'Invite a signer' : 'Set up private room'}
+                  onPress={() =>
+                    pen.privateRoom ? void inviteSigner() : onDialog({ kind: 'add', penId: pen.id })
+                  }
+                  colors={colors}
+                  busy={busy}
+                />
                 <Action
                   title='Configuration'
                   onPress={() => onDialog({ kind: 'configuration', penId: pen.id })}
@@ -564,16 +651,21 @@ export default function DialogView({
                 </View>
               </>
             )}
-            {manual && pen && state.profile && (
+            {manualAction && pen && state.profile && (
               <ManualSigning
-                method={kind}
+                method={manualAction}
                 pen={pen}
                 profile={state.profile}
-                requestId={dialog.requestId}
+                requestId={reviewed?.requestId ?? dialog.requestId}
+                manualCommit={reviewed}
                 colors={colors}
                 busy={busy}
                 setBusy={setBusy}
-                onBack={() => onDialog({ kind: 'actions', penId: pen.id })}
+                onBack={() => {
+                  if (reviewed) setConfirmReview(false)
+                  else if (dialog.automatic) onClose()
+                  else onDialog({ kind: 'actions', penId: pen.id })
+                }}
                 onOutput={output}
               />
             )}
@@ -633,7 +725,7 @@ export default function DialogView({
                   {dialog.srcKey}
                 </Text>
                 <Field
-                  label='TYPE COMMIT TO CONFIRM'
+                  label='TYPE COMMIT TO PUBLISH'
                   value={confirmation}
                   onChange={setConfirmation}
                   placeholder='COMMIT'
@@ -657,28 +749,17 @@ export default function DialogView({
               </>
             )}
             {needsPassword && (
-              <>
-                {username && (
-                  <Field
-                    label='USERNAME'
-                    value={username}
-                    colors={colors}
-                    autoComplete='username'
-                    editable={false}
-                  />
-                )}
-                <Field
-                  label='PASSWORD'
-                  value={password}
-                  onChange={setPassword}
-                  colors={colors}
-                  placeholder='Enter your key password'
-                  autoComplete='current-password'
-                  secure
-                />
-              </>
+              <KeyCredentials
+                username={
+                  state.profile!.username || state.profile!.name || state.profile!.publicKey
+                }
+                password={password}
+                onChange={setPassword}
+                colors={colors}
+                busy={busy}
+              />
             )}
-            {kind === 'output' && (
+            {kind === 'output' && !reviewed && (
               <>
                 <Text style={[styles.body, { color: colors.muted }]}>
                   Tap to copy. This stays here until you close it.
@@ -712,7 +793,20 @@ export default function DialogView({
                     </Text>
                   </View>
                 </Pressable>
-                <Action title='Close' colors={colors} onPress={onClose} />
+                {dialog.manualCommit && (
+                  <Action
+                    title='Commit'
+                    colors={colors}
+                    disabled={!pen}
+                    onPress={() => setConfirmReview(true)}
+                  />
+                )}
+                <Action
+                  title='Close'
+                  colors={colors}
+                  secondary={!!dialog.manualCommit}
+                  onPress={onClose}
+                />
               </>
             )}
             {!!error && (

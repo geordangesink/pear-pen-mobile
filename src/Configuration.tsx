@@ -15,7 +15,7 @@ import { SafeAreaView } from 'react-native-safe-area-context'
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
 import { call, errorMessage, type Pen, type State } from './client'
-import { Action, Field, Icon, Segments, type Palette } from './ui'
+import { Action, Field, Icon, KeyCredentials, Segments, type Palette } from './ui'
 import { styles } from './styles'
 
 type Document = Record<string, any>
@@ -38,12 +38,16 @@ const number = (value: string) => (/^\d+$/.test(value) ? Number(value) : value)
 
 export default function Configuration({
   pen,
+  creating,
+  profile,
   initialName = '',
   colors,
   onClose,
   onSaved
 }: {
   pen?: Pen
+  creating: boolean
+  profile: NonNullable<State['profile']>
   initialName?: string
   colors: Palette
   onClose: (name: string) => void
@@ -59,6 +63,8 @@ export default function Configuration({
   const [working, setWorking] = useState<'import' | 'preview' | 'save' | null>(null)
   const [preview, setPreview] = useState<Preview | null>(null)
   const [error, setError] = useState('')
+  const [password, setPassword] = useState('')
+  const needsPassword = creating && profile.encrypted
   const busy = loading || working !== null
   const mismatch =
     !!pen && !!preview && (preview.changed || preview.multisigKey !== pen.multisigKey)
@@ -154,11 +160,13 @@ export default function Configuration({
     setWorking('save')
     setError('')
     try {
-      const result: State = await call(pen ? 'pen.configure' : 'pen.add', {
+      const result: State = await call(creating ? 'pen.create' : 'pen.configure', {
         ...(pen && { penId: pen.id }),
         config: preview.config,
+        ...(creating && { password }),
         name: name.trim()
       })
+      setPassword('')
       const saved = result.pens.find((item) => item.multisigKey === preview.multisigKey)
       onSaved(saved?.id || preview.multisigKey)
     } catch (problem) {
@@ -183,7 +191,7 @@ export default function Configuration({
           <View style={[styles.header, { paddingHorizontal: 20, paddingBottom: 16, gap: 10 }]}>
             <Pressable
               accessibilityRole='button'
-              accessibilityLabel={pen ? 'Back to pen details' : 'Back to Add pen'}
+              accessibilityLabel={creating ? 'Back to room setup' : 'Back to pen details'}
               disabled={busy}
               onPress={() => onClose(name)}
               style={styles.iconButton}
@@ -194,7 +202,7 @@ export default function Configuration({
               numberOfLines={1}
               style={[styles.wordmark, styles.grow, { color: colors.ink, fontSize: 20 }]}
             >
-              Configuration
+              {creating ? 'Create private room' : 'Configuration'}
             </Text>
             <Pressable
               accessibilityRole='button'
@@ -214,6 +222,11 @@ export default function Configuration({
               keyboardShouldPersistTaps='handled'
               contentContainerStyle={{ paddingHorizontal: 25, paddingBottom: 25 }}
             >
+              {creating && (
+                <Text style={[styles.body, { color: colors.muted }]}>
+                  Invitees receive this configuration after they prove they are one of its signers.
+                </Text>
+              )}
               <Field
                 label='PEN NAME · OPTIONAL'
                 placeholder={link || 'Defaults to the drive link'}
@@ -395,6 +408,15 @@ export default function Configuration({
                   )}
                 </>
               )}
+              {preview && !mismatch && needsPassword && (
+                <KeyCredentials
+                  username={profile.username || profile.name || profile.publicKey}
+                  password={password}
+                  onChange={setPassword}
+                  colors={colors}
+                  busy={busy}
+                />
+              )}
               {!!error && (
                 <Text
                   accessibilityLiveRegion='polite'
@@ -416,10 +438,10 @@ export default function Configuration({
             />
             {preview && !mismatch && (
               <Action
-                title={pen ? 'Save configuration' : 'Add pen'}
+                title={creating ? 'Create room' : 'Save configuration'}
                 onPress={() => void save()}
                 colors={colors}
-                disabled={busy}
+                disabled={busy || (needsPassword && !password)}
                 busy={working === 'save'}
               />
             )}
