@@ -1,7 +1,7 @@
 {
   "name": "pear-pen-mobile",
   "productName": "PearPen",
-  "version": "0.0.2-rc.0",
+  "version": "0.0.1",
   "description": "A quiet place to sign together.",
   "upgrade": "pear://u8bhjzeu7tr83jo3afzydo6oqqa8e1pfx1ff4czdo4h5oq1849go",
   "private": true,
@@ -23,7 +23,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "prettier --check .",
     "format": "prettier --write .",
-    "test": "npm run typecheck && npm run lint && npm run test:core",
+    "test": "node --test test/*.test.js && npm run typecheck && npm run lint && npm run test:core",
     "test:core": "npm --prefix node_modules/pear-pen-core test"
   },
   "dependencies": {
@@ -45,7 +45,7 @@
     "hypercore-sign-v4": "npm:hypercore-sign@4.1.1",
     "hypercore-signing-request": "5.2.0",
     "pear-mobile": "^4.3.0",
-    "pear-pen-core": "file:vendor/pear-pen-core-1.0.0-f5b8e4b211dc.tgz",
+    "pear-pen-core": "file:vendor/pear-pen-core-1.0.0-f986fb5ae520.tgz",
     "pear-runtime": "^1.3.1",
     "pear-runtime-react-native": "^3.0.1",
     "react": "19.2.0",

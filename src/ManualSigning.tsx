@@ -11,6 +11,7 @@ import {
 } from './client'
 import { Action, Field, KeyCredentials, type Palette } from './ui'
 import { styles } from './styles'
+import { usePassword } from './usePassword'
 
 export type ManualAction = 'request' | 'sign' | 'response' | 'verify' | 'review' | 'commit'
 
@@ -67,7 +68,7 @@ export default function ManualSigning({
   const [publicKey, setPublicKey] = useState('')
   const [pasted, setPasted] = useState(false)
   const [details, setDetails] = useState<(RequestDetails & { signer: string }) | null>(null)
-  const [password, setPassword] = useState('')
+  const password = usePassword()
   const [confirmation, setConfirmation] = useState('')
   const [error, setError] = useState('')
   const submitting = useRef(false)
@@ -80,7 +81,7 @@ export default function ManualSigning({
 
   function move(next: number) {
     setError('')
-    setPassword('')
+    password.clear()
     setConfirmation('')
     setStep(next)
   }
@@ -256,25 +257,18 @@ export default function ManualSigning({
       label = profile.encrypted ? 'Confirm signing key' : 'Confirm key and sign'
     } else {
       input = (
-        <KeyCredentials
-          username={profile.name}
-          password={password}
-          onChange={setPassword}
-          colors={colors}
-          busy={busy}
-        />
+        <KeyCredentials username={profile.name} password={password} colors={colors} busy={busy} />
       )
       label = 'Sign request'
-      disabled = !password
+      disabled = !password.filled
     }
     if (step === 3 || (step === 2 && !profile.encrypted)) {
       run = async () => {
         const result = await call('manual.response', {
           penId: pen.id,
           request: request.trim(),
-          password
+          password: password.take()
         })
-        setPassword('')
         await onOutput(result, 'Signature response')
       }
     }

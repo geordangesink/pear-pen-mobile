@@ -8,6 +8,7 @@ import {
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import { styles } from './styles'
+import type { usePassword } from './usePassword'
 
 type IconName = React.ComponentProps<typeof Ionicons>['name']
 
@@ -103,11 +104,13 @@ export function Field({
   mono = false,
   numeric = false,
   editable = true,
-  autoComplete,
+  autoComplete = 'off',
+  inputRef,
   ...inputProps
 }: {
   label: string
-  value: string
+  value?: string
+  inputRef?: React.Ref<TextInput>
   onChange?: (value: string) => void
   placeholder?: string
   colors: Palette
@@ -121,9 +124,11 @@ export function Field({
       <Text style={[styles.fieldLabel, { color: colors.muted }]}>{label}</Text>
       <TextInput
         {...inputProps}
+        ref={inputRef}
         accessibilityLabel={label}
         autoComplete={autoComplete}
-        importantForAutofill={autoComplete === 'off' ? 'no' : autoComplete ? 'yes' : 'auto'}
+        textContentType={autoComplete === 'off' ? 'none' : undefined}
+        importantForAutofill={autoComplete === 'off' ? 'no' : 'yes'}
         autoCapitalize='none'
         autoCorrect={false}
         keyboardType={numeric ? 'number-pad' : undefined}
@@ -150,13 +155,11 @@ export function Field({
 export function KeyCredentials({
   username,
   password,
-  onChange,
   colors,
   busy
 }: {
   username: string
-  password: string
-  onChange: (value: string) => void
+  password: ReturnType<typeof usePassword>
   colors: Palette
   busy: boolean
 }) {
@@ -175,8 +178,8 @@ export function KeyCredentials({
       />
       <Field
         label='KEY PASSWORD'
-        value={password}
-        onChange={onChange}
+        inputRef={password.input}
+        onChange={password.onChange}
         colors={colors}
         placeholder='Enter your key password'
         autoComplete='current-password'

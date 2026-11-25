@@ -15,6 +15,7 @@ import { requireOptionalNativeModule } from 'expo-modules-core'
 import { call, errorMessage } from './client'
 import { Action, Field, Icon, type Palette } from './ui'
 import { styles } from './styles'
+import { usePassword } from './usePassword'
 
 export default function Onboarding({
   colors,
@@ -29,8 +30,8 @@ export default function Onboarding({
   const [importing, setImporting] = useState(false)
   const [publicKey, setPublic] = useState('')
   const [secretKey, setSecret] = useState('')
-  const [newPassword, setNewPassword] = useState('')
-  const [keyPassword, setKeyPassword] = useState('')
+  const [unlocking, setUnlocking] = useState(false)
+  const password = usePassword()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const hasSecret = !!secretKey.trim()
@@ -41,7 +42,6 @@ export default function Onboarding({
     if (importing) {
       setPublic('')
       setSecret('')
-      setKeyPassword('')
     }
     setError('')
     setImporting(!importing)
@@ -71,6 +71,12 @@ export default function Onboarding({
       setError('Add the private key, or clear both keys to create new ones.')
       return
     }
+    if (generating && !unlocking) {
+      setName(username)
+      setError('')
+      setUnlocking(true)
+      return
+    }
     setBusy(true)
     setError('')
     setName(username)
@@ -81,15 +87,20 @@ export default function Onboarding({
         name: username,
         publicKey: publicKey.trim(),
         secretKey: secretKey.trim(),
-        password: hasSecret ? keyPassword : newPassword
+        ...(unlocking && { password: password.take(generating) })
       })
       if (!hasSecret && Platform.OS === 'android') {
         const autofill = requireOptionalNativeModule<{ commit(): Promise<void> }>('PenAutofill')
         await autofill?.commit().catch(() => {})
       }
     } catch (problem) {
-      setName(name)
-      setError(errorMessage(problem))
+      password.clear()
+      if (problem instanceof Error && 'code' in problem && problem.code === 'PASSWORD_REQUIRED') {
+        setUnlocking(true)
+      } else {
+        setName(name)
+        setError(errorMessage(problem))
+      }
     } finally {
       setBusy(false)
       onSubmitting(false)
@@ -117,27 +128,31 @@ export default function Onboarding({
           autoComplete={Platform.OS === 'android' && !hasSecret ? 'username-new' : 'username'}
           maxLength={120}
         />
-        <Field
-          key={hasSecret ? 'current-password' : 'new-password'}
-          label={hasSecret ? 'KEY PASSWORD · IF ENCRYPTED' : 'PASSWORD'}
-          value={hasSecret ? keyPassword : newPassword}
-          onChange={busy ? undefined : hasSecret ? setKeyPassword : setNewPassword}
-          placeholder={hasSecret ? 'Enter your key password' : 'Create a password'}
-          autoComplete={hasSecret ? 'current-password' : 'new-password'}
-          colors={colors}
-          secure
-        />
-        <Pressable
-          accessibilityRole='button'
-          accessibilityState={{ expanded: importing }}
-          disabled={busy}
-          onPress={toggleImport}
-          style={styles.importToggle}
-        >
-          <Text style={[styles.importText, { color: colors.muted }]}>Import keys (optional)</Text>
-          <Icon name={importing ? 'chevron-up' : 'chevron-down'} color={colors.muted} size={15} />
-        </Pressable>
-        {importing && (
+        {unlocking && (
+          <Field
+            key={hasSecret ? 'current-password' : 'new-password'}
+            label={hasSecret ? 'KEY PASSWORD' : 'CREATE PASSWORD'}
+            inputRef={password.input}
+            onChange={busy ? undefined : password.onChange}
+            placeholder={hasSecret ? 'Enter your key password' : 'Create a password'}
+            autoComplete={hasSecret ? 'current-password' : 'new-password'}
+            colors={colors}
+            secure
+          />
+        )}
+        {!unlocking && (
+          <Pressable
+            accessibilityRole='button'
+            accessibilityState={{ expanded: importing }}
+            disabled={busy}
+            onPress={toggleImport}
+            style={styles.importToggle}
+          >
+            <Text style={[styles.importText, { color: colors.muted }]}>Import keys (optional)</Text>
+            <Icon name={importing ? 'chevron-up' : 'chevron-down'} color={colors.muted} size={15} />
+          </Pressable>
+        )}
+        {!unlocking && importing && (
           <>
             <View style={styles.labelRow}>
               <Text style={[styles.fieldLabel, { color: colors.muted }]}>
@@ -205,8 +220,21 @@ export default function Onboarding({
           onPress={() => void submit()}
           colors={colors}
           busy={busy}
-          disabled={generating && !newPassword}
+          disabled={unlocking && !password.filled}
         />
+        {unlocking && (
+          <Action
+            title='Back'
+            secondary
+            colors={colors}
+            disabled={busy}
+            onPress={() => {
+              password.clear()
+              setError('')
+              setUnlocking(false)
+            }}
+          />
+        )}
       </ScrollView>
     </KeyboardAvoidingView>
   )

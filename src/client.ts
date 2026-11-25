@@ -123,7 +123,9 @@ function start() {
         if (!request) return
         if (message.error) {
           request.reject(
-            new Error(typeof message.error === 'string' ? message.error : message.error.message)
+            Object.assign(new Error(message.error.message || message.error), {
+              code: message.error.code
+            })
           )
         } else request.resolve(message.result)
       } else if (message.type === 'warning') {
@@ -139,10 +141,13 @@ function start() {
       notify()
     }
   })
-  pipe.on('error', (error) => {
+  const disconnected = (error: Error) => {
+    for (const id of pending.keys()) takeRequest(id)?.reject(error)
     failure = error.message
     notify()
-  })
+  }
+  pipe.on('error', disconnected)
+  pipe.on('close', () => disconnected(new Error('The signing service has stopped.')))
   call('state.get')
     .then((result) => {
       if (result?.settings) {
@@ -161,15 +166,21 @@ export function call(method: string, params: Record<string, unknown> = {}): Prom
     if (!pipe) return reject(new Error('The signing service is starting.'))
     const id = ++serial
     const expire = () => {
-      takeRequest(id)?.reject(
-        new Error('This is taking longer than expected. Check your connection and try again.')
-      )
+      let message = 'The signing service took too long to respond. Try again.'
+      if (method === 'pen.create') {
+        message = 'Room creation timed out. Check your pen list before trying again.'
+      } else if (method === 'pen.join') {
+        void call('pen.cancelJoin').catch(() => {})
+        message = 'Joining timed out. Keep both devices online with Pear Pen open and try again.'
+      }
+      takeRequest(id)?.reject(new Error(message))
     }
     const request = {
       resolve,
       reject,
       timer: setTimeout(expire, 120000),
       refresh: () => {
+        if (method !== 'request.commit' && method !== 'manual.commit') return
         clearTimeout(request.timer)
         request.timer = setTimeout(expire, 120000)
       }
@@ -179,6 +190,8 @@ export function call(method: string, params: Record<string, unknown> = {}): Prom
       pipe.write(JSON.stringify({ id, method, params }))
     } catch (error) {
       takeRequest(id)?.reject(error)
+    } finally {
+      params = {}
     }
   })
 }

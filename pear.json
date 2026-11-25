@@ -2,7 +2,10 @@
   "updates": { "minver": "1.0.0" },
   "multisig": {
     "namespace": "pearpen/mobile",
-    "publicKeys": ["p813tbta5oaf83fddrxdru4tyc19r1mxir1wdeqqj65ew6oucr4o", "xhqs5zzche71siyefqkg838q1zuroe1ar7pyqwhk9if6trdrpqhy"],
+    "publicKeys": [
+      "p813tbta5oaf83fddrxdru4tyc19r1mxir1wdeqqj65ew6oucr4o",
+      "xhqs5zzche71siyefqkg838q1zuroe1ar7pyqwhk9if6trdrpqhy"
+    ],
     "quorum": 2
   }
 }

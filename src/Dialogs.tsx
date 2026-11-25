@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
@@ -28,6 +28,7 @@ import PenAvatar from './PenAvatar'
 import { choosePenImage } from './pen-images'
 import { Action, Field, Icon, KeyCredentials, RoomDetails, Segments, type Palette } from './ui'
 import { styles } from './styles'
+import { usePassword } from './usePassword'
 import { version } from '../package.json'
 
 export type Dialog = OutputOptions & {
@@ -127,7 +128,17 @@ export default function DialogView({
   const [editing, setEditing] = useState(false)
   const [exportKind, setExportKind] = useState<'public' | 'private' | null>(null)
   const [key, setKey] = useState('')
-  const [password, setPassword] = useState('')
+  const password = usePassword()
+  const [inviteDrive, setInviteDrive] = useState('')
+  const joining = useRef(false)
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      if (joining.current) void call('pen.cancelJoin').catch(() => {})
+    }
+  }, [])
   const [confirmation, setConfirmation] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -135,13 +146,16 @@ export default function DialogView({
   const [confirmReview, setConfirmReview] = useState(false)
   const reviewed = confirmReview && pen ? dialog.manualCommit : undefined
   const manualAction = reviewed ? 'commit' : manual ? kind : undefined
-  const needsPassword = (kind === 'unlock' || kind === 'join') && state.profile?.encrypted
+  const needsPassword =
+    (kind === 'unlock' || (kind === 'join' && !!inviteDrive)) && state.profile?.encrypted
   const needsKey = kind === 'join' || kind === 'request'
   const submitDisabled =
-    (needsPassword && !password) ||
+    (needsPassword && !password.filled) ||
     (needsKey && !key.trim()) ||
     (kind === 'commit' && confirmation !== 'COMMIT')
-  const submitTitle = !manual && submitTitles[kind]
+  const submitTitle =
+    !manual &&
+    (kind === 'join' && !inviteDrive && state.profile?.encrypted ? 'Continue' : submitTitles[kind])
   const title =
     (reviewed ? 'Commit release' : '') ||
     (exportKind ? `Export ${exportKind} key` : '') ||
@@ -168,10 +182,17 @@ export default function DialogView({
     onDialog(await saveOutput(result, title, options))
   }
   async function submit() {
+    if (busy || joining.current) return
     setBusy(true)
     setError('')
     try {
       if (kind === 'join') {
+        if (!inviteDrive && state.profile?.encrypted) {
+          const checked = await call('pen.inspectInvite', { penId: pen?.id, invite: key.trim() })
+          if (mounted.current) setInviteDrive(checked.multisigKey)
+          return
+        }
+        joining.current = true
         const existing = new Set(
           state.pens.filter((item) => item.privateRoom).map((item) => item.id)
         )
@@ -179,11 +200,12 @@ export default function DialogView({
           penId: pen?.id,
           name: name.trim(),
           invite: key.trim(),
-          password
+          ...(state.profile?.encrypted && { password: password.take() })
         })
+        if (!mounted.current || !joining.current) return
+        joining.current = false
         const joined =
           pen?.id ?? result.pens.find((item) => item.privateRoom && !existing.has(item.id))?.id
-        setPassword('')
         if (joined) {
           onSelectPen(joined)
           onDialog(null)
@@ -194,8 +216,11 @@ export default function DialogView({
         setEditing(false)
         onToast('Name saved')
       } else if (kind === 'unlock') {
-        await call('request.sign', { penId: pen!.id, password, requestId: dialog.requestId })
-        setPassword('')
+        await call('request.sign', {
+          penId: pen!.id,
+          password: password.take(),
+          requestId: dialog.requestId
+        })
         onClose()
         onToast('Signature sent')
       } else if (kind === 'request') {
@@ -215,9 +240,10 @@ export default function DialogView({
         }
       }
     } catch (problem) {
-      setError(errorMessage(problem))
+      if (mounted.current) setError(errorMessage(problem))
     } finally {
-      setBusy(false)
+      joining.current = false
+      if (mounted.current) setBusy(false)
     }
   }
 
@@ -304,7 +330,11 @@ export default function DialogView({
   }
 
   function closeSheet() {
-    if (busy) return
+    if (joining.current) {
+      joining.current = false
+      void call('pen.cancelJoin').catch(() => {})
+    } else if (busy) return
+    password.clear()
     if (exportKind) setExportKind(null)
     else onClose()
   }
@@ -314,7 +344,6 @@ export default function DialogView({
       <Configuration
         pen={pen}
         creating={!!dialog.creating}
-        profile={state.profile!}
         initialName={dialog.name}
         colors={colors}
         onClose={(name) =>
@@ -351,7 +380,7 @@ export default function DialogView({
             <Text style={[styles.sheetTitle, { color: colors.ink }]}>{title}</Text>
             <Pressable
               accessibilityLabel='Close dialog'
-              disabled={busy}
+              disabled={busy && kind !== 'join'}
               onPress={closeSheet}
               style={[styles.closeButton, { backgroundColor: colors.soft }]}
             >
@@ -385,16 +414,21 @@ export default function DialogView({
                 />
               </>
             )}
-            {kind === 'join' && (
+            {kind === 'join' && !inviteDrive && (
               <>
                 <Text style={[styles.body, { color: colors.muted }]}>
-                  {busy ? 'Connecting to inviter…' : 'Paste an invite from a signer who is online.'}
+                  {busy
+                    ? state.profile?.encrypted
+                      ? 'Checking invite…'
+                      : 'Connecting to inviter…'
+                    : 'Paste an invite from a signer who is online.'}
                 </Text>
                 <Field
                   label='ROOM INVITE'
                   value={key}
                   onChange={setKey}
                   placeholder='pear-pen://invite/…'
+                  autoComplete='off'
                   colors={colors}
                   mono
                   multiline
@@ -746,16 +780,25 @@ export default function DialogView({
                 </Text>
               </>
             )}
-            {needsPassword && (
+            {kind === 'join' && !!inviteDrive && (
+              <>
+                <Text style={[styles.body, { color: colors.muted }]}>
+                  {busy ? 'Connecting to inviter…' : 'Unlock your signing key to join this room.'}
+                </Text>
+                <Text selectable style={[styles.reviewKey, { color: colors.ink }]}>
+                  pear://{inviteDrive}
+                </Text>
+              </>
+            )}
+            {needsPassword && !busy && (
               <KeyCredentials
                 username={state.profile!.name}
                 password={password}
-                onChange={setPassword}
                 colors={colors}
                 busy={busy}
               />
             )}
-            {kind === 'join' && (
+            {kind === 'join' && !inviteDrive && (
               <RoomDetails
                 value={name}
                 onChange={setName}
@@ -829,6 +872,18 @@ export default function DialogView({
                 colors={colors}
                 busy={busy}
                 disabled={submitDisabled}
+              />
+            )}
+            {kind === 'join' && !!inviteDrive && !busy && (
+              <Action
+                title='Back'
+                colors={colors}
+                secondary
+                onPress={() => {
+                  password.clear()
+                  setError('')
+                  setInviteDrive('')
+                }}
               />
             )}
             {kind === 'settings' && !exportKind && (

@@ -15,7 +15,7 @@ import { SafeAreaView } from 'react-native-safe-area-context'
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
 import { call, errorMessage, type Pen, type State } from './client'
-import { Action, Field, Icon, KeyCredentials, RoomDetails, Segments, type Palette } from './ui'
+import { Action, Field, Icon, RoomDetails, Segments, type Palette } from './ui'
 import { styles } from './styles'
 
 type Document = Record<string, any>
@@ -39,7 +39,6 @@ const number = (value: string) => (/^\d+$/.test(value) ? Number(value) : value)
 export default function Configuration({
   pen,
   creating,
-  profile,
   initialName,
   colors,
   onClose,
@@ -47,7 +46,6 @@ export default function Configuration({
 }: {
   pen?: Pen
   creating: boolean
-  profile: NonNullable<State['profile']>
   initialName?: string
   colors: Palette
   onClose: (name: string) => void
@@ -63,8 +61,6 @@ export default function Configuration({
   const [working, setWorking] = useState<'import' | 'preview' | 'save' | null>(null)
   const [preview, setPreview] = useState<Preview | null>(null)
   const [error, setError] = useState('')
-  const [password, setPassword] = useState('')
-  const needsPassword = creating && profile.encrypted
   const busy = loading || working !== null
   const mismatch =
     !!pen && !!preview && (preview.changed || preview.multisigKey !== pen.multisigKey)
@@ -158,6 +154,10 @@ export default function Configuration({
     }
   }
 
+  function back() {
+    if (!busy) onClose(name)
+  }
+
   async function save() {
     if (busy || !preview || mismatch) return
     setWorking('save')
@@ -166,10 +166,8 @@ export default function Configuration({
       const result: State = await call(creating ? 'pen.create' : 'pen.configure', {
         ...(pen && { penId: pen.id }),
         config: preview.config,
-        ...(creating && { password }),
         name: name.trim()
       })
-      setPassword('')
       const saved = result.pens.find((item) => item.multisigKey === preview.multisigKey)
       onSaved(saved?.id || preview.multisigKey)
     } catch (problem) {
@@ -180,12 +178,7 @@ export default function Configuration({
   }
 
   return (
-    <Modal
-      visible
-      animationType='slide'
-      presentationStyle='fullScreen'
-      onRequestClose={() => !busy && onClose(name)}
-    >
+    <Modal visible animationType='slide' presentationStyle='fullScreen' onRequestClose={back}>
       <SafeAreaView style={[styles.page, { backgroundColor: colors.background }]}>
         <KeyboardAvoidingView
           style={styles.page}
@@ -196,7 +189,7 @@ export default function Configuration({
               accessibilityRole='button'
               accessibilityLabel={creating ? 'Back to room setup' : 'Back to pen details'}
               disabled={busy}
-              onPress={() => onClose(name)}
+              onPress={back}
               style={styles.iconButton}
             >
               <Icon name='chevron-back' color={colors.ink} />
@@ -406,15 +399,6 @@ export default function Configuration({
                   )}
                 </>
               )}
-              {preview && !mismatch && needsPassword && (
-                <KeyCredentials
-                  username={profile.name}
-                  password={password}
-                  onChange={setPassword}
-                  colors={colors}
-                  busy={busy}
-                />
-              )}
               <RoomDetails
                 value={name}
                 onChange={setName}
@@ -451,7 +435,7 @@ export default function Configuration({
                 title={creating ? 'Create room' : 'Save configuration'}
                 onPress={() => void save()}
                 colors={colors}
-                disabled={busy || (needsPassword && !password)}
+                disabled={busy}
                 busy={working === 'save'}
               />
             )}
