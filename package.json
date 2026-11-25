@@ -3,7 +3,7 @@
   "productName": "PearPen",
   "version": "1.0.0",
   "description": "A quiet place to sign together.",
-  "upgrade": "pear://q7uqtpch8rywqos6tg7op6rq6wtbagwky81i5oa4ksdpgoq16y8o",
+  "upgrade": "pear://u8bhjzeu7tr83jo3afzydo6oqqa8e1pfx1ff4czdo4h5oq1849go",
   "private": true,
   "main": "index.ts",
   "license": "Apache-2.0",
@@ -82,12 +82,5 @@
       "hyperdrive": "^13.3.4"
     },
     "sodium-native": "5.2.1"
-  },
-  "grocer": {
-    "upgrades": {
-      "production": "pear://tu3my1zhrqwde5c441eqswgar9riroqhpwo4dx1t6j7uns1t7pgy",
-      "dev": "pear://q7uqtpch8rywqos6tg7op6rq6wtbagwky81i5oa4ksdpgoq16y8o",
-      "provision": "pear://gweiy3ybbhkhb94q7iaxgdb7eg75617xbme9qexnpw96ydgm18oo"
-    }
   }
 }
