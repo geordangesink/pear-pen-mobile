@@ -1,5 +1,5 @@
 {
-  "updates": { "minver": "1.0.0" },
+  "updates": { "minver": "0.0.1" },
   "multisig": {
     "namespace": "pearpen/mobile",
     "publicKeys": [

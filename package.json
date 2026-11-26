@@ -1,7 +1,7 @@
 {
   "name": "pear-pen-mobile",
   "productName": "PearPen",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "A quiet place to sign together.",
   "upgrade": "pear://u8bhjzeu7tr83jo3afzydo6oqqa8e1pfx1ff4czdo4h5oq1849go",
   "private": true,
